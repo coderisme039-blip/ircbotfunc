@@ -21,7 +21,6 @@ def health_check():
     return "Bots are active and running 24/7.", 200
 
 def run_http_server():
-    # Render provides the PORT environment variable
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
 
@@ -39,7 +38,10 @@ class IRCBot:
 
     def send(self, msg):
         if self.running:
-            self.irc.send(bytes(f"{msg}\r\n", "UTF-8"))
+            try:
+                self.irc.send(bytes(f"{msg}\r\n", "UTF-8"))
+            except:
+                self.running = False
 
     def privmsg(self, target, msg):
         self.send(f"PRIVMSG {target} :{msg}")
@@ -49,12 +51,12 @@ class IRCBot:
         return nick == self.admin
 
     def idle_prevention(self):
-        """Sends a lightweight message every 4 minutes to prevent timeout."""
+        """Sends a safe periodic activity ping or check to prevent timeout."""
         while self.running:
             time.sleep(240)
             try:
-                # Sending a NOOP or a self-targeted message keeps the socket alive
-                self.send(f"NOOP")
+                # Send a safe server query instead of invalid NOOP
+                self.send(f"PING {SERVER}")
             except:
                 break
 
@@ -114,28 +116,23 @@ class ChiefOper(IRCBot):
         parts = line.split()
         if len(parts) < 2: return
 
-        # Handle Commands
         if "PRIVMSG" in parts:
             sender_prefix = parts[0]
             sender_nick = sender_prefix.split('!')[0].replace(':', '')
             target = parts[2]
             message = " ".join(parts[3:])[1:]
 
-            # If message is to the bot directly (PM)
             if target == self.nickname:
                 target = sender_nick
 
-            # Admin Claim
             if message == "!admison":
                 self.admin = sender_nick
                 self.privmsg(target, f"Admin successfully claimed by: {self.admin}")
                 return
 
-            # Lock Mode Check
             if self.only_admin_mode and not self.is_admin(sender_prefix):
                 return
 
-            # Admin Features
             if self.is_admin(sender_prefix):
                 if message == "!onlyadm-":
                     self.only_admin_mode = not self.only_admin_mode
@@ -154,7 +151,6 @@ class ChiefOper(IRCBot):
                     acmds = "!onlyadm-, !gamemodeon, !gamemodeoff, !functionalmodeon, !functionalmodeoff, .pm <target> <msg>, .passmsg <target> <msg>"
                     self.privmsg(target, f"Admin-Only Commands: {acmds}")
 
-            # Help & Rules
             if message == ".helpcww":
                 rules = [
                     "# Channel Rules",
@@ -177,7 +173,6 @@ class ChiefOper(IRCBot):
                 u_list = "!slap, !hug, !cookie, !greet, !roast, !compliment, !exit, !hi5, !pat, !coffee, !flip, !unflip, !shrug, !dance, !cheers, !8ball, !choose, !define, !reminder, !joke, !fact, !fortune, !poll, !rep, !points, !bio, !profile"
                 self.privmsg(target, f"User Commands: {u_list}")
 
-            # Functional User Commands
             if self.functional_mode:
                 self.process_user_commands(sender_nick, target, message)
 
@@ -187,7 +182,6 @@ class ChiefOper(IRCBot):
         cmd = cmd_parts[0].lower()
         args = cmd_parts[1:]
 
-        # Simple Action Commands
         actions = {
             "!slap": "slaps {0} with a wet fish!",
             "!hug": "hugs {0} tightly!",
@@ -211,7 +205,6 @@ class ChiefOper(IRCBot):
         elif cmd == "!shrug": self.privmsg(target, "¯\_(ツ)_/¯")
         elif cmd == "!dance": self.privmsg(target, "└(＾＾)┐ ┌(＾＾)┘")
 
-        # Utility Commands
         elif cmd == "!8ball":
             ans = ["Yes", "No", "Most likely", "Outlook hazy", "Signs point to yes", "Absolutely not"]
             self.privmsg(target, f"Magic 8-Ball: {random.choice(ans)}")
@@ -289,20 +282,17 @@ class MrTracker(IRCBot):
         parts = line.split()
         if len(parts) < 2: return
 
-        # JOIN Event
         if "JOIN" in parts:
             nick = parts[0].split('!')[0].replace(':', '')
             if nick != self.nickname:
                 self.privmsg(CHANNEL, f"Welcome to #chatwithworld, {nick}! Type .helpcww to view rules and !usercmd for user commands.")
 
-        # PRIVMSG Logging & Commands
         if "PRIVMSG" in parts:
             sender_prefix = parts[0]
             sender_nick = sender_prefix.split('!')[0].replace(':', '')
             target = parts[2]
             message = " ".join(parts[3:])[1:]
 
-            # Track Activity (Only in channels)
             if target.startswith("#"):
                 self.logs[sender_nick.lower()] = {
                     "time": datetime.now().strftime("%H:%M:%S"),
@@ -311,12 +301,10 @@ class MrTracker(IRCBot):
                 }
                 self.save_logs()
 
-            # Admin Claim for Tracker
             if message == "!admison":
                 self.admin = sender_nick
                 self.privmsg(target, f"Tracker Admin set to: {self.admin}")
 
-            # Seen Command
             if message.startswith("!seen "):
                 query = message.split()[1].lower()
                 if query in self.logs:
@@ -333,6 +321,9 @@ if __name__ == "__main__":
     # 2. Start ChiefOper
     chief = ChiefOper()
     threading.Thread(target=chief.connect, daemon=True).start()
+
+    # Stagger connection to prevent IP flood/collision drop
+    time.sleep(3)
 
     # 3. Start MrTracker
     tracker = MrTracker()
