@@ -261,11 +261,11 @@ class ChiefOper(IRCBot):
             pts = self.user_data["points"].get(sender, 0)
             self.privmsg(target, f"{sender}, you have {pts} reputation points.")
 
-# --- BOT 2: MRTRACKER ---
-class MrTracker(IRCBot):
+# --- BOT 2: MRLogger ---
+class MrLogger(IRCBot):
     def __init__(self):
-        super().__init__("MrTracker", "MrTracker")
-        self.log_file = "tracker_data.json"
+        super().__init__("MrLogger", "MrLogger")
+        self.log_file = "Logger_data.json"
         self.logs = self.load_logs()
 
     def load_logs(self):
@@ -303,7 +303,7 @@ class MrTracker(IRCBot):
 
             if message == "!admison":
                 self.admin = sender_nick
-                self.privmsg(target, f"Tracker Admin set to: {self.admin}")
+                self.privmsg(target, f"Logger Admin set to: {self.admin}")
 
             if message.startswith("!seen "):
                 query = message.split()[1].lower()
@@ -325,9 +325,9 @@ if __name__ == "__main__":
     # Stagger connection to prevent IP flood/collision drop
     time.sleep(3)
 
-    # 3. Start MrTracker
-    tracker = MrTracker()
-    threading.Thread(target=tracker.connect, daemon=True).start()
+    # 3. Start MrLogger
+    Logger = MrLogger()
+    threading.Thread(target=Logger.connect, daemon=True).start()
 
     # Keep main thread alive
     while True:
