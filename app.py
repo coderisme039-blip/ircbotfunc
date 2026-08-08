@@ -4,7 +4,7 @@ import time
 import json
 import os
 import random
-from datetime import datetime
+from datetime import datetime, timezone
 from flask import Flask
 
 # --- CONFIGURATION ---
@@ -173,7 +173,7 @@ class ChiefOper(IRCBot):
                 for r in rules: self.privmsg(target, r)
 
             elif message in ["!usercmd", "!usercmd-"]:
-                u_list = "!slap, !hug, !cookie, !greet, !roast, !compliment, !joke, !fact, !reminder <min> <msg>, .tell <user> <msg>"
+                u_list = "!slap, !hug, !cookie, !greet, !roast, !compliment, !joke, !fact, !reminder <min> <msg>, .tell <user> <msg>, !seen / .seen <user>"
                 self.privmsg(target, f"User Commands: {u_list}")
 
             if self.functional_mode:
@@ -205,6 +205,22 @@ class ChiefOper(IRCBot):
                 def send_rem(): self.privmsg(target, f"🔔 REMINDER for {sender}: {rem_text}")
                 threading.Timer(minutes * 60, send_rem).start()
                 self.privmsg(target, f"Okay {sender}, I'll remind you in {minutes} minute(s).")
+
+        elif cmd == "!joke":
+            jokes = [
+                "Why do programmers prefer dark mode? Because light attracts bugs.",
+                "A SQL query walks into a bar, walks up to two tables and asks, 'Can I join you?'",
+                "There are 10 types of people in the world: those who understand binary, and those who don't."
+            ]
+            self.privmsg(target, random.choice(jokes))
+
+        elif cmd == "!fact":
+            facts = [
+                "Honey is the only food that doesn't spoil.",
+                "An octopus has three hearts.",
+                "The programming language Python was named after Monty Python."
+            ]
+            self.privmsg(target, random.choice(facts))
 
         elif cmd == "!bio":
             if args:
@@ -247,7 +263,7 @@ class MrLogger(IRCBot):
         if "mailbox" in self.data and nick_low in self.data["mailbox"]:
             messages = self.data["mailbox"][nick_low]
             for m in messages:
-                self.privmsg(target, f"✉️ {nick}, Message from {m['from']} ({m['time']}): {m['msg']}")
+                self.privmsg(target, f"✉️ {nick}, Message from {m['from']} ({m['time']} UTC): {m['msg']}")
             del self.data["mailbox"][nick_low]
             self.save_data()
 
@@ -258,8 +274,9 @@ class MrLogger(IRCBot):
         # Handling Joins
         if parts[1] == "JOIN":
             sender_nick = parts[0].split('!')[0].lstrip(':')
+            target_chan = parts[2].lstrip(':') if len(parts) > 2 else CHANNELS[0]
             if sender_nick != self.nickname:
-                self.check_mailbox(sender_nick, CHANNELS[0])
+                self.check_mailbox(sender_nick, target_chan if target_chan.startswith("#") else CHANNELS[0])
                 if "#ChatWithWorld" in line:
                     self.privmsg(CHANNELS[0], f"Welcome {sender_nick}!")
 
@@ -271,14 +288,33 @@ class MrLogger(IRCBot):
             if message.startswith(':'): message = message[1:]
 
             if sender_nick != self.nickname:
-                self.check_mailbox(sender_nick, target)
+                self.check_mailbox(sender_nick, target if target.startswith("#") else CHANNELS[0])
 
             if target.startswith("#"):
                 self.data["logs"][sender_nick.lower()] = {
-                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
                     "phrase": message
                 }
                 self.save_data()
+
+            if message.startswith("!seen ") or message.startswith(".seen "):
+                args = message.split()
+                if len(args) > 1:
+                    query = args[1].lower()
+                    if query in self.data["logs"]:
+                        d = self.data["logs"][query]
+                        logged_time = datetime.strptime(d['time'], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                        now = datetime.now(timezone.utc)
+                        diff = int((now - logged_time).total_seconds())
+                        
+                        hours = diff // 3600
+                        minutes = (diff % 3600) // 60
+                        seconds = diff % 60
+                        
+                        time_str = f"{hours}h {minutes}m {seconds}s ago"
+                        self.privmsg(target, f"I last saw {query} {time_str} (UTC time: {d['time']}) saying: \"{d['phrase']}\"")
+                    else:
+                        self.privmsg(target, f"I have no record of {query}.")
 
             if message.startswith(".tell "):
                 args = message.split(maxsplit=2)
@@ -288,7 +324,7 @@ class MrLogger(IRCBot):
                     self.data["mailbox"][recipient].append({
                         "from": sender_nick,
                         "msg": args[2],
-                        "time": datetime.now().strftime("%H:%M")
+                        "time": datetime.now(timezone.utc).strftime("%H:%M")
                     })
                     self.save_data()
                     self.privmsg(target, f"I'll tell {args[1]} next time they are active.")
