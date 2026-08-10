@@ -47,7 +47,10 @@ class IRCBot:
                 self.running = False
 
     def privmsg(self, target, msg):
+        """Sends PRIVMSG with flood protection delay."""
         self.send(f"PRIVMSG {target} :{msg}")
+        # 0.3 second throttle delay prevents Excess Flood drops on multi-line outputs
+        time.sleep(0.3)
 
     def is_admin(self, prefix):
         nick = prefix.split('!')[0].replace(':', '')
@@ -60,6 +63,7 @@ class IRCBot:
 
     def connect(self):
         print(f"[{self.nickname}] Connecting to {SERVER}...")
+        self.running = True
         try:
             self.irc = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.irc.connect((SERVER, PORT))
@@ -74,6 +78,7 @@ class IRCBot:
             while self.running:
                 data = self.irc.recv(2048).decode("UTF-8", errors="replace")
                 if not data:
+                    print(f"[{self.nickname}] Socket closed by remote host.")
                     break
                 
                 buffer += data
@@ -89,13 +94,21 @@ class IRCBot:
                             self.send(f"JOIN {chan}")
                             time.sleep(0.5)
                     
-                    self.handle_message(line)
+                    # Safe message handler execution to protect the loop
+                    try:
+                        self.handle_message(line)
+                    except Exception as err:
+                        print(f"[{self.nickname}] Exception in handle_message: {err}")
+
         except Exception as e:
             print(f"[{self.nickname}] Connection error: {e}")
-            self.running = False
         finally:
+            self.running = False
             if self.irc:
-                self.irc.close()
+                try:
+                    self.irc.close()
+                except Exception:
+                    pass
 
     def handle_message(self, line):
         pass
@@ -520,17 +533,31 @@ class MrLogger(IRCBot):
                     self.save_data()
                     self.privmsg(target, f"I'll tell {args[1]} next time they are active.")
 
+# --- AUTO-RECONNECT WRAPPER ---
+def run_bot_with_reconnect(bot_instance):
+    while True:
+        try:
+            bot_instance.connect()
+        except Exception as e:
+            print(f"[{bot_instance.nickname}] Fatal bot loop error: {e}")
+        print(f"[{bot_instance.nickname}] Connection dropped. Attempting reconnect in 10 seconds...")
+        time.sleep(10)
+
 # --- EXECUTION ---
 if __name__ == "__main__":
+    # Start web server
     threading.Thread(target=run_http_server, daemon=True).start()
 
+    # Start ChiefOper with auto-reconnect
     chief = ChiefOper()
-    threading.Thread(target=chief.connect, daemon=True).start()
+    threading.Thread(target=run_bot_with_reconnect, args=(chief,), daemon=True).start()
 
-    time.sleep(10) # Stagger connections
+    time.sleep(5)  # Stagger connections
 
+    # Start MrLogger with auto-reconnect
     logger_bot = MrLogger()
-    threading.Thread(target=logger_bot.connect, daemon=True).start()
+    threading.Thread(target=run_bot_with_reconnect, args=(logger_bot,), daemon=True).start()
 
+    # Main thread keep-alive
     while True:
         time.sleep(30)
