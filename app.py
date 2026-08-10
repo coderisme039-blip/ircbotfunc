@@ -12,9 +12,14 @@ from datetime import datetime, timezone, timedelta
 from flask import Flask
 
 try:
-    import yt_dlp
+    import requests
 except ImportError:
-    yt_dlp = None
+    requests = None
+
+try:
+    from youtubesearchpython import VideosSearch
+except ImportError:
+    VideosSearch = None
 
 # ============================================================
 # CONFIGURATION
@@ -104,6 +109,14 @@ class IRCBot:
     def _create_socket(self):
         raw_socket = socket.create_connection((SERVER, PORT), timeout=30)
         context = ssl.create_default_context()
+        # Some IRC networks (hybridirc included) drop connections abruptly
+        # instead of sending a proper TLS close_notify. Without this option,
+        # OpenSSL 3.x/Python 3.11+ raises SSLEOFError ("TLS connection was
+        # non-properly terminated") for what is really just a normal
+        # disconnect. This makes recv() return b"" instead, which the loop
+        # below already treats as a clean disconnect -> triggers reconnect.
+        if hasattr(ssl, "OP_IGNORE_UNEXPECTED_EOF"):
+            context.options |= ssl.OP_IGNORE_UNEXPECTED_EOF
         wrapped = context.wrap_socket(raw_socket, server_hostname=SERVER)
         return wrapped
 
@@ -138,7 +151,7 @@ class IRCBot:
                 print(f"[{self.nickname}] No data in 300s - assuming dead connection.")
                 break
             except Exception as e:
-                print(f"[{self.nickname}] recv() error: {e}")
+                print(f"[{self.nickname}] recv() error: {type(e).__name__}: {e}")
                 break
 
             if not data:
@@ -750,17 +763,21 @@ class ChiefOper(IRCBot):
         if parts[1] == "JOIN":
             sender_nick = parts[0].split('!')[0].lstrip(':')
             target_chan = parts[2].lstrip(':') if len(parts) > 2 else ""
+            # IRC channel names are case-insensitive on the wire - the server
+            # may echo JOIN back with different casing than CHANNELS uses
+            # (e.g. "#chatwithworld" vs "#ChatWithWorld"), so compare lower().
+            chan_lower = target_chan.lower()
 
             if sender_nick != self.nickname:
-                if target_chan == "#ChatWithWorld":
+                if chan_lower == "#chatwithworld":
                     self.privmsg(
                         target_chan,
                         f"👋 Welcome {sender_nick} to #ChatWithWorld! Say .helpcww for the "
                         f"rules or !usercmd- to see everything I can do."
                     )
-                elif target_chan == "#Games":
+                elif chan_lower == "#games":
                     self.privmsg(target_chan, f"🎮 Hey {sender_nick}! Welcome to #Games. Have fun!")
-                elif target_chan == "#CWWHelp":
+                elif chan_lower == "#cwwhelp":
                     self.privmsg(target_chan, f"❓ Welcome {sender_nick} to #CWWHelp! Ask your questions here or use .helpcww.")
 
         if parts[1] == "PRIVMSG" and len(parts) >= 4:
@@ -1366,57 +1383,77 @@ class YoutubeSearch(IRCBot):
         self.last_search = 0.0
         self.search_lock = threading.Lock()
 
-    def youtube_search(self, query, timeout=25):
-        """
-        Uses yt-dlp as a Python library (works identically on Render's Linux
-        containers and locally - no hardcoded filesystem paths, no subprocess).
-        """
-        if yt_dlp is None:
-            print("yt-dlp library is not installed.")
-            return None
+    def _search_primary(self, query, result_holder):
+        """Primary lookup via the youtube-search-python library."""
+        if VideosSearch is None:
+            return
+        try:
+            videos_search = VideosSearch(query, limit=1)
+            results = videos_search.result()
+            result_list = results.get("result") if results else None
+            if result_list:
+                first = result_list[0]
+                title = first.get("title", "YouTube video")
+                video_id = first.get("id")
+                url = first.get("link") or (
+                    f"https://www.youtube.com/watch?v={video_id}" if video_id else None
+                )
+                if url:
+                    result_holder["data"] = (title, url)
+        except Exception as exc:
+            print(f"[{self.nickname}] youtube-search-python failed: {exc}")
 
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "skip_download": True,
-            "extract_flat": True,
-            "default_search": "ytsearch1",
-            "noplaylist": True,
-        }
+    def _search_fallback(self, query, result_holder):
+        """Fallback: scrape YouTube's search results page directly via requests."""
+        if requests is None:
+            return
+        try:
+            encoded_query = urllib.parse.quote(query)
+            search_url = f"https://www.youtube.com/results?search_query={encoded_query}"
+            resp = requests.get(
+                search_url,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+                timeout=8,
+            )
+            resp.raise_for_status()
+            html = resp.text
+            video_ids = re.findall(r"watch\?v=([a-zA-Z0-9_-]{11})", html)
+            if video_ids:
+                vid = video_ids[0]
+                title_matches = re.findall(r'"title":\{"runs":\[\{"text":"([^"]+)"\}', html)
+                title = title_matches[0] if title_matches else "YouTube Video"
+                result_holder["data"] = (title, f"https://www.youtube.com/watch?v={vid}")
+        except Exception as exc:
+            print(f"[{self.nickname}] Fallback YouTube search error: {exc}")
+
+    def youtube_search(self, query, timeout=15):
+        """
+        Looks up a YouTube video for `query`.
+        Tries the youtube-search-python library first, then falls back to a
+        direct HTML scrape via requests if that fails or returns nothing.
+        Runs in a worker thread with a hard timeout so a hung request can
+        never freeze the bot's IRC loop.
+        """
+        query = query.strip()
+        if not query:
+            return None
 
         result_holder = {}
 
         def _run():
-            try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    result_holder["data"] = ydl.extract_info(query, download=False)
-            except Exception as exc:
-                result_holder["error"] = exc
+            self._search_primary(query, result_holder)
+            if "data" not in result_holder:
+                self._search_fallback(query, result_holder)
 
         worker = threading.Thread(target=_run, daemon=True)
         worker.start()
         worker.join(timeout)
 
         if worker.is_alive():
-            print("YouTube search timed out.")
-            return None
-        if "error" in result_holder:
-            print("YouTube search error:", result_holder["error"])
+            print(f"[{self.nickname}] YouTube search timed out.")
             return None
 
-        data = result_holder.get("data")
-        if not data:
-            return None
-        entries = data.get("entries") if isinstance(data, dict) else None
-        video = entries[0] if entries else data
-        if not video:
-            return None
-        video_id = video.get("id")
-        title = video.get("title", "YouTube video")
-        if not video_id:
-            return None
-        url = f"https://www.youtube.com/watch?v={video_id}"
-        return title, url
+        return result_holder.get("data")
 
     def handle_message(self, line):
         parts = line.split(' ')
@@ -1468,21 +1505,55 @@ class YoutubeSearch(IRCBot):
 # ============================================================
 # EXECUTION
 # ============================================================
+_bots_started = False
+_bots_lock = threading.Lock()
+
+
+def start_bots():
+    """
+    Starts all three IRC bots as background daemon threads, staggering
+    their connections so they don't hit the server all at once.
+    Idempotent - calling this more than once in the same process is a no-op.
+    """
+    global _bots_started
+    with _bots_lock:
+        if _bots_started:
+            return
+        _bots_started = True
+
+        chief = ChiefOper()
+        threading.Thread(target=chief.run_forever, daemon=True).start()
+
+        def start_logger():
+            time.sleep(5)
+            logger_bot = MrLogger()
+            threading.Thread(target=logger_bot.run_forever, daemon=True).start()
+
+        threading.Thread(target=start_logger, daemon=True).start()
+
+        def start_yt():
+            time.sleep(10)
+            yt_bot = YoutubeSearch()
+            threading.Thread(target=yt_bot.run_forever, daemon=True).start()
+
+        threading.Thread(target=start_yt, daemon=True).start()
+
+
+# Start the IRC bots as soon as this module is imported - not just inside
+# `if __name__ == "__main__"`. This matters because gunicorn (now in
+# requirements.txt) imports this file and serves the `app` object directly;
+# it never runs the __main__ block below, so the old placement would leave
+# the bots never starting under `gunicorn app:app`.
+#
+# IMPORTANT if deploying with gunicorn: use exactly ONE worker, e.g.
+#   gunicorn app:app --workers 1
+# Each gunicorn worker is a separate process/interpreter - more than one
+# worker would start duplicate copies of all three bots fighting over the
+# same nicknames on the same channels.
+start_bots()
+
 if __name__ == "__main__":
-    threading.Thread(target=run_http_server, daemon=True).start()
-
-    chief = ChiefOper()
-    threading.Thread(target=chief.run_forever, daemon=True).start()
-
-    time.sleep(5)  # stagger connections
-
-    logger_bot = MrLogger()
-    threading.Thread(target=logger_bot.run_forever, daemon=True).start()
-
-    time.sleep(5)
-
-    yt_bot = YoutubeSearch()
-    threading.Thread(target=yt_bot.run_forever, daemon=True).start()
-
-    while True:
-        time.sleep(30)
+    # Direct run (no gunicorn): serve the Flask health-check endpoint
+    # ourselves. Under gunicorn, gunicorn serves `app` instead and this
+    # block is never reached.
+    run_http_server()
