@@ -141,6 +141,7 @@ class IRCBot:
         self.send(f"NICK {self.nickname}")
         self.send(f"USER {self.nickname} 0 * :{self.realname}")
 
+        # Check for activity (re-added to maintain structure)
         threading.Thread(target=self.idle_prevention, daemon=True).start()
 
         buffer = ""
@@ -1508,6 +1509,23 @@ class YoutubeSearch(IRCBot):
 
 
 # ============================================================
+# BOT 4: YOUTUBEFORNETCAFE
+# ============================================================
+class YoutubeForNetCafe(YoutubeSearch):
+    def __init__(self):
+        # Initialize directly with IRCBot but inherit all logic from YoutubeSearch
+        IRCBot.__init__(
+            self,
+            "YoutubeForNetCafe",
+            "YoutubeForNetCafe",
+            channels=["#NetCafe"],
+            send_delay=0
+        )
+        self.last_search = 0.0
+        self.search_lock = threading.Lock()
+
+
+# ============================================================
 # EXECUTION
 # ============================================================
 _bots_started = False
@@ -1516,7 +1534,7 @@ _bots_lock = threading.Lock()
 
 def start_bots():
     """
-    Starts all three IRC bots as background daemon threads, staggering
+    Starts all four IRC bots as background daemon threads, staggering
     their connections so they don't hit the server all at once.
     Idempotent - calling this more than once in the same process is a no-op.
     """
@@ -1542,6 +1560,13 @@ def start_bots():
             threading.Thread(target=yt_bot.run_forever, daemon=True).start()
 
         threading.Thread(target=start_yt, daemon=True).start()
+
+        def start_netcafe():
+            time.sleep(15)
+            cafe_bot = YoutubeForNetCafe()
+            threading.Thread(target=cafe_bot.run_forever, daemon=True).start()
+
+        threading.Thread(target=start_netcafe, daemon=True).start()
 
 
 # Start the IRC bots as soon as this module is imported - not just inside
