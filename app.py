@@ -11,6 +11,8 @@ import urllib.parse
 from datetime import datetime, timezone, timedelta
 from flask import Flask
 
+import storage
+
 try:
     import requests
 except ImportError:
@@ -26,7 +28,7 @@ except ImportError:
 # ============================================================
 SERVER = os.environ.get("IRC_SERVER", "irc.hybridirc.com")
 PORT = int(os.environ.get("IRC_PORT", "6697"))          # SSL port
-CHANNELS = ["#ChatWithWorld", "#Games", "#CWWHelp"]
+CHANNELS = ["#ChatWithWorld", "#Games", "#CWWHelp", "#global"]
 YT_CHANNEL = os.environ.get("YT_CHANNEL", "#ChatWithWorld")
 DEFAULT_ADMIN = "Antonio"
 
@@ -36,6 +38,20 @@ DEFAULT_ADMIN = "Antonio"
 NICKSERV_PASS = os.environ.get("NICKSERV_PASS", "").strip()
 
 COMMAND_COOLDOWN = 10  # seconds between .yt searches
+
+# ---------------- MagicalFairy star game settings ----------------
+# All game tuning lives here. For quick testing you can shorten these via
+# environment variables (and remove them again for production).
+FAIRY_CHANNEL = "#global"                                              # game runs ONLY here
+FAIRY_MIN_MINUTES = float(os.environ.get("FAIRY_MIN_MINUTES", "40"))   # min gap between stars
+FAIRY_MAX_MINUTES = float(os.environ.get("FAIRY_MAX_MINUTES", "60"))   # max gap between stars
+FAIRY_CATCH_SECONDS = float(os.environ.get("FAIRY_CATCH_SECONDS", "60"))  # catch window
+FAIRY_UNCATCHABLE_CHANCE = float(os.environ.get("FAIRY_UNCATCHABLE_CHANCE", "0.10"))  # 10%
+FAIRY_LEADERBOARD_SIZE = 10
+FAIRY_REWARD = 1                      # stars per successful catch
+FAIRY_NOTICE_COOLDOWN = 10            # seconds between "no star"/"protected star" replies (anti-spam)
+FAIRY_CMD_COOLDOWN = 5                # seconds per user between !top / !mystars
+FAIRY_STAR = "🌟"                      # the official reward emoji
 
 # ============================================================
 # WEB SERVER (for Render health checks / keep-alive)
@@ -56,7 +72,7 @@ def run_http_server():
 # ============================================================
 # BASE IRC BOT ENGINE
 # ------------------------------------------------------------
-# Hardened connection behaviour shared by all three bots:
+# Hardened connection behaviour shared by all bots:
 #   - SSL/TLS socket with SNI (ssl.create_default_context)
 #   - IRCv3 CAP LS 302 negotiation, closed with CAP END
 #   - NICK / USER registration
@@ -780,6 +796,12 @@ class ChiefOper(IRCBot):
                     self.privmsg(target_chan, f"🎮 Hey {sender_nick}! Welcome to #Games. Have fun!")
                 elif chan_lower == "#cwwhelp":
                     self.privmsg(target_chan, f"❓ Welcome {sender_nick} to #CWWHelp! Ask your questions here or use .helpcww.")
+                elif chan_lower == "#global":
+                    self.privmsg(
+                        target_chan,
+                        f"👋 Welcome {sender_nick} to #global ! Say .helpglobal for the "
+                        f"rules or !usercmd- to see everything I can do."
+                    )
 
         if parts[1] == "PRIVMSG" and len(parts) >= 4:
             sender_prefix = parts[0]
@@ -822,7 +844,7 @@ class ChiefOper(IRCBot):
                     self.animations_enabled = False
                     self.privmsg(target, "TextLab animations [OFF] (effects will send a single static line instead)")
 
-            if message == ".helpcww":
+            if message == ".helpcww" and target.lower() != "#global":
                 rules = [
                     "--- #ChatWithWorld Rules ---",
                     "1. Respect everyone. No harassment or hate speech.",
@@ -831,6 +853,17 @@ class ChiefOper(IRCBot):
                     "4. Use !usercmd- for all commands.",
                 ]
                 for r in rules:
+                    self.privmsg(target, r)
+
+            elif message == ".helpglobal":
+                global_rules = [
+                    "--- #global Rules ---",
+                    "1. Respect everyone. No harassment or hate speech.",
+                    "2. Use the existing #Games channel for bot fun-commands.",
+                    "3. Use #globalhelp for admin support.",
+                    "4. Use !usercmd- for all commands.",
+                ]
+                for r in global_rules:
                     self.privmsg(target, r)
 
             elif message in ["!usercmd", "!usercmd-"]:
@@ -1383,7 +1416,7 @@ class YoutubeSearch(IRCBot):
         super().__init__(
             "YoutubeSearch",
             f"YouTube search bot (Operator: {DEFAULT_ADMIN})",
-            channels=[YT_CHANNEL],
+            channels=[YT_CHANNEL] + ([] if YT_CHANNEL.lower() == "#global" else ["#global"]),
             send_delay=0,  # this channel is ours - no artificial reply delay needed
         )
         self.last_search = 0.0
@@ -1526,6 +1559,358 @@ class YoutubeForNetCafe(YoutubeSearch):
 
 
 # ============================================================
+# BOT 5: MAGICALFAIRY  (star-catching game, #global only)
+# ------------------------------------------------------------
+# - A single game thread owns the whole spawn -> catch/expire -> reschedule
+#   cycle, so there can never be two stars or two timers, even if the IRC
+#   connection drops and reconnects.
+# - The active star is claimed under a lock, so only one user can win it.
+# - Scores live in storage.py (SQLite); memory only holds the active star.
+# - The next spawn time is saved in storage so a restart does not reset
+#   the 40-60 minute wait.
+# ============================================================
+STAR_NAMES = [
+    "Luna", "Nova", "Stardust", "Twinkle", "Aurora", "Celestia", "Comet", "Wish",
+    "Sparkle", "Nebula", "Moonbeam", "Crystal Star", "Cosmic Pearl", "Phantom Star",
+    "Golden Wish", "Dreamlight", "Eclipse", "Silverglow", "Starwhisper", "Mystic Flame",
+    "Lumina", "Orion", "Vega", "Solstice", "Halo", "Glimmer", "Zenith", "Opal Star",
+]
+
+
+class MagicalFairy(IRCBot):
+    def __init__(self):
+        super().__init__(
+            "MagicalFairy",
+            f"MagicalFairy star game (Operator: {DEFAULT_ADMIN})",
+            channels=[FAIRY_CHANNEL],
+            send_delay=0.4,  # small delay keeps multi-line announcements from flooding
+        )
+        self.state_lock = threading.Lock()
+        self.active = None                       # the one live star (or None)
+        self.caught_event = threading.Event()
+        self.in_channel = False                  # True once we are really inside FAIRY_CHANNEL
+        self._name_bag = []
+        self._last_name = None
+        self._next_spawn = None
+        self._notice_times = {"none": 0.0, "protected": 0.0}
+        self._cmd_times = {}
+        self._notice_lock = threading.Lock()
+        self._game_started = False
+        self._game_start_lock = threading.Lock()
+
+    # ---------------- formatting ----------------
+    @staticmethod
+    def _y(text):
+        """Bold + yellow (mIRC colour 08), reset afterwards."""
+        return f"\x02\x0308{text}\x0F"
+
+    def _say(self, lines):
+        for line in lines:
+            self.privmsg(FAIRY_CHANNEL, self._y(line))
+
+    # ---------------- game thread ----------------
+    def start_game(self):
+        """Start the game loop once, no matter how many times this is called."""
+        with self._game_start_lock:
+            if self._game_started:
+                return
+            self._game_started = True
+        try:
+            storage.init_storage()
+        except Exception as exc:
+            print(f"[{self.nickname}] Storage init failed (will retry on use): {exc}")
+        threading.Thread(target=self._game_loop, daemon=True).start()
+
+    def _random_interval_seconds(self):
+        lo = min(FAIRY_MIN_MINUTES, FAIRY_MAX_MINUTES)
+        hi = max(FAIRY_MIN_MINUTES, FAIRY_MAX_MINUTES)
+        return random.uniform(lo, hi) * 60
+
+    def _schedule_next(self):
+        self._next_spawn = time.time() + self._random_interval_seconds()
+        try:
+            storage.set_meta("next_spawn", f"{self._next_spawn:.0f}")
+        except Exception as exc:
+            print(f"[{self.nickname}] Could not save next spawn time: {exc}")
+        mins = (self._next_spawn - time.time()) / 60
+        print(f"[{self.nickname}] Next star in {mins:.1f} minutes.")
+
+    def _load_next_spawn(self):
+        saved = None
+        try:
+            saved = storage.get_meta("next_spawn")
+        except Exception as exc:
+            print(f"[{self.nickname}] Could not read next spawn time: {exc}")
+        try:
+            t = float(saved) if saved is not None else None
+        except ValueError:
+            t = None
+        now = time.time()
+        if t is None:
+            self._schedule_next()
+        elif t < now:
+            self._next_spawn = now + 30  # we were offline past the due time: spawn shortly after startup
+        else:
+            self._next_spawn = t
+
+    def _game_loop(self):
+        self._load_next_spawn()
+        while True:
+            try:
+                while True:
+                    remaining = self._next_spawn - time.time()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(remaining, 15))
+                while not (self.running and self._registered and self.in_channel):
+                    time.sleep(5)
+                self._run_star_event()
+            except Exception as exc:
+                print(f"[{self.nickname}] Game loop error: {type(exc).__name__}: {exc}")
+                time.sleep(30)
+
+    def _pick_name(self):
+        if not self._name_bag:
+            bag = STAR_NAMES[:]
+            random.shuffle(bag)
+            if bag and bag[-1] == self._last_name:   # last item is popped first
+                bag[0], bag[-1] = bag[-1], bag[0]
+            self._name_bag = bag
+        name = self._name_bag.pop()
+        self._last_name = name
+        return name
+
+    def _run_star_event(self):
+        name = self._pick_name()
+        catchable = random.random() >= FAIRY_UNCATCHABLE_CHANCE
+        star = {"name": name, "catchable": catchable, "resolved": False}
+        with self.state_lock:
+            self.caught_event.clear()
+            self.active = star
+
+        print(f"[{self.nickname}] Star '{name}' appeared (catchable={catchable}).")
+        self._say([
+            f"{FAIRY_STAR} MAGICAL STAR HAS APPEARED! {FAIRY_STAR}",
+            f"✨ A star named {name} has appeared in {FAIRY_CHANNEL}",
+            "🎯 Type !catch or !grab to catch it!",
+            f"🏆 Reward: +{FAIRY_REWARD} {FAIRY_STAR} Star!",
+            f"⏳ Hurry, the magic fades in {int(FAIRY_CATCH_SECONDS)} seconds!",
+        ])
+
+        caught = self.caught_event.wait(FAIRY_CATCH_SECONDS)
+
+        expired = False
+        if not caught:
+            with self.state_lock:
+                if not star["resolved"]:      # nobody claimed it in the meantime
+                    star["resolved"] = True
+                    expired = True
+        with self.state_lock:
+            self.active = None
+
+        if expired:
+            if catchable:
+                self._say([
+                    f"{FAIRY_STAR} 💨 OH NO! {name} HAS VANISHED! 💨 {FAIRY_STAR}",
+                    "⏳ Nobody managed to catch this magical star in time",
+                    "🧚 MagicalFairy has whisked it away into another dimension",
+                    "💫 Stay alert, the next star may be even rarer!",
+                ])
+            else:
+                self._say([
+                    f"{FAIRY_STAR} 💨 OH NO! {name} has vanished into the magical universe! 💨 {FAIRY_STAR}",
+                    "🧚 MagicalFairy reveals that this star was enchanted and could not be caught!",
+                    "🍀 Better luck on the next appearance!",
+                ])
+
+        self._schedule_next()
+
+    # ---------------- anti-spam helpers ----------------
+    def _notice_ok(self, kind):
+        with self._notice_lock:
+            now = time.monotonic()
+            if now - self._notice_times[kind] < FAIRY_NOTICE_COOLDOWN:
+                return False
+            self._notice_times[kind] = now
+            return True
+
+    def _cmd_ok(self, nick, cmd):
+        key = (nick.lower(), cmd)
+        with self._notice_lock:
+            now = time.monotonic()
+            if now - self._cmd_times.get(key, 0.0) < FAIRY_CMD_COOLDOWN:
+                return False
+            self._cmd_times[key] = now
+            if len(self._cmd_times) > 500:   # keep memory bounded
+                cutoff = now - 60
+                self._cmd_times = {k: v for k, v in self._cmd_times.items() if v > cutoff}
+            return True
+
+    # ---------------- IRC events ----------------
+    def handle_message(self, line):
+        parts = line.split(' ')
+        if len(parts) < 2:
+            return
+
+        if parts[1] == "001":
+            self.in_channel = False
+            return
+
+        if parts[1] == "JOIN":
+            sender = parts[0].split('!')[0].lstrip(':')
+            chan = parts[2].lstrip(':') if len(parts) > 2 else ""
+            if sender.lower() == self.nickname.lower() and chan.lower() == FAIRY_CHANNEL.lower():
+                self.in_channel = True
+            return
+
+        if parts[1] == "KICK" and len(parts) >= 4:
+            if parts[2].lower() == FAIRY_CHANNEL.lower() and parts[3].lower() == self.nickname.lower():
+                self.in_channel = False
+
+                def rejoin():
+                    time.sleep(5)
+                    self.send(f"JOIN {FAIRY_CHANNEL}")
+
+                threading.Thread(target=rejoin, daemon=True).start()
+            return
+
+        if parts[1] != "PRIVMSG" or len(parts) < 4:
+            return
+
+        sender = parts[0].split('!')[0].lstrip(':')
+        target = parts[2]
+        if target.lower() != FAIRY_CHANNEL.lower():
+            return  # the game lives only in #global
+
+        message = " ".join(parts[3:])
+        if message.startswith(':'):
+            message = message[1:]
+        message = message.strip()
+        if not message:
+            return
+
+        cmd = message.split()[0].lower()
+        if cmd in ("!catch", "!grab"):
+            self._handle_catch(sender)
+        elif cmd == "!top":
+            if self._cmd_ok(sender, cmd):
+                self._handle_top()
+        elif cmd == "!mystars":
+            if self._cmd_ok(sender, cmd):
+                self._handle_mystars(sender)
+
+    # ---------------- commands ----------------
+    def _handle_catch(self, nick):
+        outcome = None
+        star_name = None
+        total = None
+
+        with self.state_lock:
+            star = self.active
+            if star is None or star["resolved"]:
+                outcome = "none"
+            elif not star["catchable"]:
+                outcome = "protected"
+                star_name = star["name"]
+            else:
+                # Claim the star first (atomic under the lock): nobody else can win it now.
+                star["resolved"] = True
+                self.active = None
+                star_name = star["name"]
+                try:
+                    total = storage.add_user_star(nick.lower(), nick, FAIRY_REWARD)
+                    outcome = "caught"
+                except Exception as exc:
+                    # Could not save the reward: give the star back instead of losing it.
+                    print(f"[{self.nickname}] Storage error while awarding star: {exc}")
+                    star["resolved"] = False
+                    self.active = star
+                    outcome = "storage_error"
+
+        if outcome == "caught":
+            self.caught_event.set()
+            self._say([
+                f"{FAIRY_STAR} 🎉 AMAZING! {nick} CAUGHT {FAIRY_STAR} {star_name}! 🎉 {FAIRY_STAR}",
+                f"✨ The magical star belongs to {nick}",
+                f"🏆 Reward: +{FAIRY_REWARD} {FAIRY_STAR} Star!",
+                f"💖 Total stars collected by {nick}: {total} {FAIRY_STAR}",
+                "🧚 MagicalFairy is proud of you!",
+            ])
+        elif outcome == "protected":
+            try:
+                storage.record_failed_attempt(nick.lower(), nick)
+            except Exception as exc:
+                print(f"[{self.nickname}] Could not record failed attempt: {exc}")
+            if self._notice_ok("protected"):
+                self._say([
+                    f"🧚 Oh no! {FAIRY_STAR} {star_name} is protected by ancient fairy magic!",
+                    f"🍀 Your hands passed right through it, {nick}",
+                    "💫 Keep trying your luck!",
+                ])
+        elif outcome == "none":
+            if self._notice_ok("none"):
+                self._say([
+                    f"🧚 ✨ MagicalFairy giggles! There is no star to catch right now. {FAIRY_STAR}",
+                    f"⏳ Keep an eye on {FAIRY_CHANNEL} for the next magical star",
+                ])
+        elif outcome == "storage_error":
+            if self._notice_ok("none"):
+                self._say(["🧚 The star ledger is resting. Try catching it again in a moment!"])
+
+    def _handle_top(self):
+        try:
+            top = storage.get_top_star_collectors(FAIRY_LEADERBOARD_SIZE)
+        except Exception as exc:
+            print(f"[{self.nickname}] Leaderboard error: {exc}")
+            self._say(["🧚 The star ledger is resting. Try again in a moment!"])
+            return
+
+        if not top:
+            self._say([
+                f"{FAIRY_STAR} 🏆 MAGICALFAIRY'S TOP {FAIRY_LEADERBOARD_SIZE} STAR COLLECTORS 🏆 {FAIRY_STAR}",
+                "🧚 Nobody has caught a star yet. Be the first!",
+            ])
+            return
+
+        medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+        lines = [f"{FAIRY_STAR} 🏆 MAGICALFAIRY'S TOP {FAIRY_LEADERBOARD_SIZE} STAR COLLECTORS 🏆 {FAIRY_STAR}"]
+        for i, row in enumerate(top, start=1):
+            lines.append(f"{medals.get(i, '✨')} {i}. {row['nick']} — {row['stars']} {FAIRY_STAR}")
+        lines.append("🧚 Keep catching stars and climb the leaderboard!")
+        self._say(lines)
+
+    def _handle_mystars(self, nick):
+        try:
+            stats = storage.get_user_star_stats(nick.lower())
+        except Exception as exc:
+            print(f"[{self.nickname}] Stats error: {exc}")
+            self._say(["🧚 The star ledger is resting. Try again in a moment!"])
+            return
+
+        stars = stats["stars"]
+        if stars <= 0:
+            status = "Star dreamer"
+        elif stars < 10:
+            status = "Star seeker"
+        elif stars < 25:
+            status = "Star collector"
+        else:
+            status = "Star master"
+
+        lines = [
+            f"{FAIRY_STAR} ✨ YOUR MAGICAL STAR COLLECTION ✨ {FAIRY_STAR}",
+            f"🧚 Collector: {nick}",
+            f"🏆 Total stars collected: {stars} {FAIRY_STAR}",
+            f"🎯 Successful catches: {stats['catches']}",
+        ]
+        if stats["rank"]:
+            lines.append(f"📈 Leaderboard rank: #{stats['rank']}")
+        lines.append(f"🍀 Catching status: {status}")
+        lines.append("💫 Keep going! More magical stars await you!")
+        self._say(lines)
+
+
+# ============================================================
 # EXECUTION
 # ============================================================
 _bots_started = False
@@ -1534,7 +1919,7 @@ _bots_lock = threading.Lock()
 
 def start_bots():
     """
-    Starts all four IRC bots as background daemon threads, staggering
+    Starts all five IRC bots as background daemon threads, staggering
     their connections so they don't hit the server all at once.
     Idempotent - calling this more than once in the same process is a no-op.
     """
@@ -1568,6 +1953,14 @@ def start_bots():
 
         threading.Thread(target=start_netcafe, daemon=True).start()
 
+        def start_fairy():
+            time.sleep(20)
+            fairy_bot = MagicalFairy()
+            fairy_bot.start_game()
+            threading.Thread(target=fairy_bot.run_forever, daemon=True).start()
+
+        threading.Thread(target=start_fairy, daemon=True).start()
+
 
 # Start the IRC bots as soon as this module is imported - not just inside
 # `if __name__ == "__main__"`. This matters because gunicorn (now in
@@ -1578,7 +1971,7 @@ def start_bots():
 # IMPORTANT if deploying with gunicorn: use exactly ONE worker, e.g.
 #   gunicorn app:app --workers 1
 # Each gunicorn worker is a separate process/interpreter - more than one
-# worker would start duplicate copies of all three bots fighting over the
+# worker would start duplicate copies of all the bots fighting over the
 # same nicknames on the same channels.
 start_bots()
 
