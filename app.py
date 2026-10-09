@@ -43,10 +43,10 @@ COMMAND_COOLDOWN = 10  # seconds between .yt searches
 # All game tuning lives here. For quick testing you can shorten these via
 # environment variables (and remove them again for production).
 FAIRY_CHANNEL = "#global"                                              # game runs ONLY here
-FAIRY_MIN_MINUTES = float(os.environ.get("FAIRY_MIN_MINUTES", "40"))   # min gap between stars
-FAIRY_MAX_MINUTES = float(os.environ.get("FAIRY_MAX_MINUTES", "60"))   # max gap between stars
-FAIRY_CATCH_SECONDS = float(os.environ.get("FAIRY_CATCH_SECONDS", "60"))  # catch window
-FAIRY_UNCATCHABLE_CHANCE = float(os.environ.get("FAIRY_UNCATCHABLE_CHANCE", "0.10"))  # 10%
+FAIRY_MIN_MINUTES = float(os.environ.get("FAIRY_MIN_MINUTES", "25"))   # min gap between stars
+FAIRY_MAX_MINUTES = float(os.environ.get("FAIRY_MAX_MINUTES", "35"))   # max gap between stars
+FAIRY_CATCH_SECONDS = float(os.environ.get("FAIRY_CATCH_SECONDS", "30"))  # catch window
+FAIRY_UNCATCHABLE_CHANCE = float(os.environ.get("FAIRY_UNCATCHABLE_CHANCE", "0.20"))  # 10%
 FAIRY_LEADERBOARD_SIZE = 10
 FAIRY_REWARD = 1                      # stars per successful catch
 FAIRY_NOTICE_COOLDOWN = 10            # seconds between "no star"/"protected star" replies (anti-spam)
