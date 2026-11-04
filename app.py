@@ -12,6 +12,7 @@ from datetime import datetime, timezone, timedelta
 from flask import Flask
 
 import storage
+from sudoku_bot import SudokuBot
 
 try:
     import requests
@@ -43,10 +44,10 @@ COMMAND_COOLDOWN = 10  # seconds between .yt searches
 # All game tuning lives here. For quick testing you can shorten these via
 # environment variables (and remove them again for production).
 FAIRY_CHANNEL = "#global"                                              # game runs ONLY here
-FAIRY_MIN_MINUTES = float(os.environ.get("FAIRY_MIN_MINUTES", "25"))   # min gap between stars
-FAIRY_MAX_MINUTES = float(os.environ.get("FAIRY_MAX_MINUTES", "35"))   # max gap between stars
-FAIRY_CATCH_SECONDS = float(os.environ.get("FAIRY_CATCH_SECONDS", "30"))  # catch window
-FAIRY_UNCATCHABLE_CHANCE = float(os.environ.get("FAIRY_UNCATCHABLE_CHANCE", "0.20"))  # 10%
+FAIRY_MIN_MINUTES = float(os.environ.get("FAIRY_MIN_MINUTES", "40"))   # min gap between stars
+FAIRY_MAX_MINUTES = float(os.environ.get("FAIRY_MAX_MINUTES", "60"))   # max gap between stars
+FAIRY_CATCH_SECONDS = float(os.environ.get("FAIRY_CATCH_SECONDS", "60"))  # catch window
+FAIRY_UNCATCHABLE_CHANCE = float(os.environ.get("FAIRY_UNCATCHABLE_CHANCE", "0.10"))  # 10%
 FAIRY_LEADERBOARD_SIZE = 10
 FAIRY_REWARD = 1                      # stars per successful catch
 FAIRY_NOTICE_COOLDOWN = 10            # seconds between "no star"/"protected star" replies (anti-spam)
@@ -1919,7 +1920,7 @@ _bots_lock = threading.Lock()
 
 def start_bots():
     """
-    Starts all five IRC bots as background daemon threads, staggering
+    Starts all six IRC bots as background daemon threads, staggering
     their connections so they don't hit the server all at once.
     Idempotent - calling this more than once in the same process is a no-op.
     """
@@ -1960,6 +1961,13 @@ def start_bots():
             threading.Thread(target=fairy_bot.run_forever, daemon=True).start()
 
         threading.Thread(target=start_fairy, daemon=True).start()
+
+        def start_sudoku():
+            time.sleep(25)
+            sudoku_bot = SudokuBot()
+            threading.Thread(target=sudoku_bot.run, daemon=True).start()
+
+        threading.Thread(target=start_sudoku, daemon=True).start()
 
 
 # Start the IRC bots as soon as this module is imported - not just inside
