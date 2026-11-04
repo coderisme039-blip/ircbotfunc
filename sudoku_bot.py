@@ -33,6 +33,14 @@ from typing import Optional
 
 
 LOG = logging.getLogger("sudoku")
+if not LOG.handlers:
+    # app.py never calls logging.basicConfig, so without this the INFO lines
+    # (connecting, joined, retrying...) would be invisible in the Render logs.
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [Sudoku] %(message)s"))
+    LOG.addHandler(_handler)
+    LOG.setLevel(logging.INFO)
+    LOG.propagate = False
 
 DEFAULT_CHANNELS = ["#Games", "#global"]
 ROWS = "abcdefghi"
