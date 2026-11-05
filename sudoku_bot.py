@@ -52,17 +52,25 @@ DIFFICULTIES = {
     "!master": (21, 4.0),
     "!extreme": (17, 5.0),
 }
-POINTS = {
-    "easy": 50,
-    "medium": 100,
-    "hard": 200,
-    "expert": 300,
-    "master": 400,
-    "extreme": 500,
+POINTS = {                # points earned per correct guess
+    "easy": 5,
+    "medium": 10,
+    "hard": 20,
+    "expert": 30,
+    "master": 40,
+    "extreme": 50,
 }
-MISTAKE_PENALTY = 5      # points lost per mistake
-MAX_MISTAKES = 10        # more than this many mistakes = LOSE
-PENDING_TIMEOUT = 120    # seconds to pick a difficulty
+TIME_LIMITS = {           # maximum game length in seconds
+    "easy": 45 * 60,
+    "medium": 45 * 60,
+    "hard": 45 * 60,
+    "expert": 90 * 60,
+    "master": 90 * 60,
+    "extreme": 90 * 60,
+}
+MISTAKE_PENALTY = 25     # points lost per mistake
+MAX_MISTAKES = 5         # more than this many mistakes = LOSE
+PENDING_TIMEOUT = 20     # seconds to pick a difficulty
 LEADERBOARD_SIZE = 10
 MAX_BATCH = 30           # most guesses accepted in one !fill line
 SPTS_COOLDOWN = 5        # seconds between !spts per channel
@@ -105,7 +113,7 @@ def choose_lines():
 
 def fill_usage_line():
     cmd = (
-        "\x02" + "!" + f"\x03{BLACK}fill\x03" + " "
+        "\x02" + "!fill" + " "
         + f"\x03{PINK}A\x03" + f"\x03{RED}a\x03" + " " + f"\x03{BLUE}5\x03"
         + "\x02"
     )
@@ -330,8 +338,8 @@ class SudokuStore:
         self._ready = True
 
     # ---- points ----
-    def add_points(self, nick: str, points: int) -> int:
-        """Add points (and one win). Returns the player's new total."""
+    def add_points(self, nick: str, points: int, win: bool = True) -> int:
+        """Add points (and one win if `win`). Returns the player's new total."""
         uid = nick.strip().lower()
         with self.lock:
             self._init_locked()
@@ -340,13 +348,13 @@ class SudokuStore:
                     conn.execute(
                         """
                         INSERT INTO sudoku_players (user_id, nick, points, wins)
-                        VALUES (?, ?, ?, 1)
+                        VALUES (?, ?, ?, ?)
                         ON CONFLICT(user_id) DO UPDATE SET
                             nick   = excluded.nick,
                             points = sudoku_players.points + excluded.points,
-                            wins   = sudoku_players.wins + 1
+                            wins   = sudoku_players.wins + excluded.wins
                         """,
-                        (uid, nick, int(points)),
+                        (uid, nick, int(points), 1 if win else 0),
                     )
                     row = conn.execute(
                         "SELECT points FROM sudoku_players WHERE user_id = ?", (uid,)
@@ -413,7 +421,10 @@ class Game:
     clues: int = 0
     mistakes: int = 0
     pending_since: float = 0.0
-    contributors: list[str] = field(default_factory=list)   # everyone who made a correct fill
+    players: dict = field(default_factory=dict)             # per-player guesses and mistakes
+    correct_count: int = 0                                  # correct guesses so far (all players)
+    started_at: float = 0.0
+    time_limit: float = 0.0
     givens: list[list[bool]] = field(
         default_factory=lambda: [[False for _ in range(9)] for _ in range(9)]
     )
@@ -688,8 +699,8 @@ class SudokuBot:
     # ---------------- channel commands ----------------
     @staticmethod
     def _points_now(game: Game) -> int:
-        base = POINTS.get(game.difficulty or "", 0)
-        return max(0, base - MISTAKE_PENALTY * game.mistakes)
+        per_guess = POINTS.get(game.difficulty or "", 0)
+        return max(0, per_guess * game.correct_count - MISTAKE_PENALTY * game.mistakes)
 
     def _handle_message(self, sender: str, channel: str, raw_message: str) -> None:
         key = channel.lower()
@@ -762,13 +773,14 @@ class SudokuBot:
             self._handle_fill(sender, channel, key, game, message)
             return
 
-        if command == "!giveupgame" and (game.active or game.pending):
+        if command == "!sgiveup" and (game.active or game.pending):
             if sender.lower() != (game.player or "").lower() and not is_admin:
                 self.notice(sender, "Only the player who started the game (or an admin) can give up.")
                 return
             if game.active:
                 self.say(channel, f"{logo()} Game over. Solution:")
                 self.say(channel, format_board(game.solution, game.givens))
+                self._announce_winners(channel, game, "Results:", finished=False)
             else:
                 self.say(channel, "Game cancelled.")
             self.games[key] = Game()
@@ -790,12 +802,15 @@ class SudokuBot:
             board=board,
             solution=solution,
             givens=[[value != 0 for value in row] for row in board],
+            started_at=time.monotonic(),
+            time_limit=TIME_LIMITS.get(name, 0),
         )
+        blanks = sum(1 for line in board for cell in line if cell == 0)
         self.games[key] = new_game
         self.say(
             channel,
             f"{logo()} {style(name.capitalize() + ' Level', None, True)} Started | "
-            f"Total Points {style(str(POINTS[name]), BLUE, True)}",
+            f"Total Points {style(str(blanks * POINTS[name]), BLUE, True)}",
         )
         self.say(channel, fill_usage_line())
         self.say(channel, pro_tip_line())
@@ -844,11 +859,17 @@ class SudokuBot:
             f"You {style('LOSE', RED, True)}. Solution:",
         )
         self.say(channel, format_board(game.solution, game.givens))
+        self._announce_winners(channel, game, "Results:", finished=False)
         self.games[key] = Game()
 
-    def _add_contributor(self, game: Game, sender: str) -> None:
-        if sender.lower() not in [name.lower() for name in game.contributors]:
-            game.contributors.append(sender)
+    @staticmethod
+    def _record(game: Game, sender: str, correct: int = 0, wrong: int = 0) -> None:
+        entry = game.players.setdefault(
+            sender.lower(), {"nick": sender, "guesses": 0, "mistakes": 0}
+        )
+        entry["guesses"] += correct
+        entry["mistakes"] += wrong
+        game.correct_count += correct
 
     def _fill_single(self, sender, channel, key, game, coordinate, value_text) -> None:
         parsed = self._parse_guess(coordinate, value_text)
@@ -862,6 +883,7 @@ class SudokuBot:
 
         if game.solution[row][col] != value:
             game.mistakes += 1
+            self._record(game, sender, wrong=1)
             if game.mistakes > MAX_MISTAKES:
                 self._lose(channel, key, game)
             else:
@@ -873,7 +895,7 @@ class SudokuBot:
             return
 
         game.board[row][col] = value
-        self._add_contributor(game, sender)
+        self._record(game, sender, correct=1)
         self.say(channel, f"{logo()} Correct \U0001f389")
         self.say(channel, format_board(game.board, game.givens))
         if all(cell != 0 for line in game.board for cell in line):
@@ -893,20 +915,19 @@ class SudokuBot:
                 filled.append(label)
             elif game.solution[row][col] != value:
                 game.mistakes += 1
+                self._record(game, sender, wrong=1)
                 wrong.append(label)
                 if game.mistakes > MAX_MISTAKES:
                     self._lose(channel, key, game)
                     return
             else:
                 game.board[row][col] = value
+                self._record(game, sender, correct=1)
                 correct.append(label)
 
         if not (correct or wrong or filled):
             self.say(channel, self.FILL_USAGE)
             return
-
-        if correct:
-            self._add_contributor(game, sender)
 
         def group(labels):
             return style("[" + ", ".join(labels) + "]", PINK)
@@ -930,24 +951,34 @@ class SudokuBot:
             self._announce_winners(channel, game)
             self.games[key] = Game()
 
-    def _announce_winners(self, channel: str, game: Game) -> None:
-        base = POINTS.get(game.difficulty or "", 0)
-        final = self._points_now(game)
-        deducted = base - final
+    def _announce_winners(self, channel: str, game: Game, title: str = "Winners:", finished: bool = True) -> None:
+        """
+        Each player is paid for their own correct guesses and charged for their own
+        mistakes (never below 0). Used when the puzzle is solved (finished=True) and
+        also when a game ends early (give up, too many mistakes, time up): points
+        earned so far are still awarded, but it only counts as a win if solved.
+        """
+        per_guess = POINTS.get(game.difficulty or "", 0)
+        winners = [p for p in game.players.values() if p["guesses"] > 0]
+        if not winners:
+            return
         failed = False
-        self.say(channel, f"{logo()} Winners:")
-        for index, name in enumerate(game.contributors, start=1):
+        self.say(channel, f"{logo()} {title}")
+        for index, player in enumerate(winners, start=1):
+            base = player["guesses"] * per_guess
+            deducted = player["mistakes"] * MISTAKE_PENALTY
+            final = max(0, base - deducted)
             try:
-                self.store.add_points(name, final)
+                self.store.add_points(player["nick"], final, win=finished)
             except Exception:
-                LOG.exception("Could not save points for %s.", name)
+                LOG.exception("Could not save points for %s.", player["nick"])
                 failed = True
             b = lambda t: style(t, None, True)
             self.say(
                 channel,
-                f"[{index}] {b(name)} \U0001f389\n"
+                f"[{index}] {b(player['nick'])} \U0001f389\n"
                 f" {b('G')}ame {b('p')}oints: {style(str(base), PINK, True)}\n"
-                f"\u274c {b('M')}istakes: {style(str(game.mistakes), PINK, True)}\n"
+                f"\u274c {b('M')}istakes: {style(str(player['mistakes']), PINK, True)}\n"
                 f"\u2796 {b('D')}educted: {style(str(deducted), PINK, True)} {b('p')}oints\n"
                 f"\U0001f31f {b('F')}inal {b('p')}oints: {style(str(final), PINK, True)}",
             )
@@ -963,15 +994,18 @@ class SudokuBot:
         return [
             f"{logo()} {style('FAQ', None, True)}",
             f"\U0001f3ae {cmd('!sudoku')} - start a game, then pick a level",
-            f"\U0001f3af Levels: {levels}",
+            f"\U0001f3af Levels: {levels} within {style('20s', PINK)}",
+            f"\U0001f522 {style('Points', None, True)} are as per {style('each', PINK)} guess.",
             f"\u270f\ufe0f {cmd('!fill Aa 5')} - put 5 in row A, column a (anyone can play)",
             pro_tip_line(),
             f"\U0001f4cb {cmd('!su')} or {cmd('.su')} - show the current board and game status",
             f"\U0001f3c6 {cmd('!spts')} - points ranking",
             f"\U0001f4d6 {cmd('!notation')} - how the coordinates work",
-            f"\U0001f3f3\ufe0f {cmd('!giveupgame')} - end the game (whoever started it, or an admin)",
+            f"\U0001f3f3\ufe0f {cmd('!sgiveup')} - end the game (whoever started it, or an admin)",
             f"\u26a0\ufe0f {style('Scoring', None, True)}: each mistake costs {MISTAKE_PENALTY} points. "
             f"More than {MAX_MISTAKES} mistakes = you {style('LOSE', RED, True)}.",
+            f"\u23f3 {style('Max time', None, True)}: {style('45 mins', PINK)} - Easy, Medium, Hard",
+            f"\u23f3 {style('Max time', None, True)}: {style('90 mins', PINK)} - Expert, Master, Extreme",
         ]
 
     def _show_status(self, channel: str, game: Game) -> None:
@@ -1037,7 +1071,13 @@ class SudokuBot:
     def _expire_pending(self) -> None:
         now = time.monotonic()
         for key, game in list(self.games.items()):
+            channel = self.channels.get(key, key)
             if game.pending and now - game.pending_since > PENDING_TIMEOUT:
                 player = game.player or "The player"
                 self.games[key] = Game()
-                self.say(self.channels.get(key, key), f"{player}'s difficulty selection expired. Start again with !sudoku.")
+                self.say(channel, f"{player}'s game was cancelled because no level was chosen. Start again with !sudoku.")
+            elif game.active and game.time_limit and now - game.started_at > game.time_limit:
+                self.games[key] = Game()
+                self.say(channel, f"{logo()} \u23f0 Time is up! Game over. Solution:")
+                self.say(channel, format_board(game.solution, game.givens))
+                self._announce_winners(channel, game, "Results:", finished=False)
