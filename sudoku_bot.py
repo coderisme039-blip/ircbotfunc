@@ -8,6 +8,7 @@ Optional environment settings:
   IRC_PORT                IRC server port (default: 6697)
   SUDOKU_NICK             Bot nickname (default: DrSudoku)
   SUDOKU_ADMINS           Comma-separated admin nicks (default: Antonio,Starboy)
+  SUDOKU_NICKSERV_PASS    Optional override for the NickServ password set in the code
   SUDOKU_DB               Database file (default: sudoku.db) - separate from MagicalFairy
   IRC_SSL                 Set to 0 to disable TLS
 
@@ -453,6 +454,10 @@ class SudokuBot:
             LOG.warning("Invalid IRC_PORT; using 6697.")
             self.port = 6697
         self.nick = os.getenv("SUDOKU_NICK", "DrSudoku")
+        self.base_nick = self.nick
+        # NickServ password for DrSudoku (private repo). An environment variable,
+        # if you ever set SUDOKU_NICKSERV_PASS, overrides this default.
+        self.nickserv_pass = os.getenv("SUDOKU_NICKSERV_PASS", "heyhey123").strip()
         admins = os.getenv("SUDOKU_ADMINS", "Antonio,Starboy")
         self.admins = {a.strip().lower() for a in admins.split(",") if a.strip()}
         self.use_ssl = os.getenv("IRC_SSL", "1") != "0"
@@ -602,6 +607,12 @@ class SudokuBot:
             self.online = True
             LOG.info("Connected as %s. Joining %d channel(s).", self.nick, len(self.channels))
             self._send_raw(f"MODE {self.nick} +B")
+            if self.nickserv_pass and self.nick == self.base_nick:
+                self._send_raw(f"PRIVMSG NickServ :IDENTIFY {self.nickserv_pass}")
+                LOG.info("Sent NickServ IDENTIFY for %s.", self.nick)
+                time.sleep(1)   # give services a moment before joining channels
+            elif self.nickserv_pass:
+                LOG.warning("Nick %s is not %s; skipping NickServ IDENTIFY.", self.nick, self.base_nick)
             for name in self.channels.values():
                 self._send_raw(f"JOIN {name}")
             return
