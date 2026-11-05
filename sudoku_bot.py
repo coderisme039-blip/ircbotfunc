@@ -110,7 +110,7 @@ def fill_usage_line():
     )
     return (
         f"Use {cmd} ("
-        f"{style('column', PINK)}, {style('row', RED)}, {style('number', BLUE)})"
+        f"{style('row', PINK)}, {style('column', RED)}, {style('number', BLUE)})"
     )
 
 
@@ -711,7 +711,7 @@ class SudokuBot:
             return
 
         if command == "!notation":
-            self.say(channel, "Columns = A-I, rows = a-i. Example: !fill Bi 5 puts 5 in column B, row i.")
+            self.say(channel, "Rows = A-I, columns = a-i. Example: !fill Bi 5 puts 5 in row B, column i.")
             self.say(channel, f"Notation link: {self.notation_link}")
             return
 
@@ -798,16 +798,9 @@ class SudokuBot:
             value = int(args[2]) if len(args) > 2 else 0
         except ValueError:
             value = 0
-        # Uppercase letter A-I = column, lowercase letter a-i = row.
-        # Normal order is column first ("Bi" = column B, row i); "iB" also works.
-        # If both letters are the same case, the first is the column.
-        row = col = -1
-        if len(coordinate) >= 2:
-            first, second = coordinate[0], coordinate[1]
-            if first.islower() and second.isupper():
-                row, col = ROWS.find(first), ROWS.find(second.lower())
-            else:
-                col, row = ROWS.find(first.lower()), ROWS.find(second.lower())
+        # First letter = row (A-I), second letter = column (a-i); case does not matter.
+        row = ROWS.find(coordinate[0].lower()) if len(coordinate) >= 1 else -1
+        col = ROWS.find(coordinate[1].lower()) if len(coordinate) >= 2 else -1
         if (
             len(args) != 3
             or len(coordinate) != 2
@@ -815,7 +808,7 @@ class SudokuBot:
             or col < 0
             or not 1 <= value <= 9
         ):
-            self.say(channel, "Use: !fill Aa 5 (column A-I, row a-i, number 1-9).")
+            self.say(channel, "Use: !fill Aa 5 (row A-I, column a-i, number 1-9).")
             return
         if game.board[row][col] != 0:
             cell = f"{coordinate[0].upper()}{coordinate[1]}"
@@ -884,7 +877,7 @@ class SudokuBot:
             f"{logo()} {style('FAQ', None, True)}",
             f"\U0001f3ae {cmd('!sudoku')} - start a game, then pick a level",
             f"\U0001f3af Levels: {levels}",
-            f"\u270f\ufe0f {cmd('!fill Aa 5')} - put 5 in column A, row a (anyone can play)",
+            f"\u270f\ufe0f {cmd('!fill Aa 5')} - put 5 in row A, column a (anyone can play)",
             f"\U0001f4cb {cmd('!su')} or {cmd('.su')} - show the current board and game status",
             f"\U0001f3c6 {cmd('!spts')} - points ranking",
             f"\U0001f4d6 {cmd('!notation')} - how the coordinates work",
