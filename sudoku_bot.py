@@ -6,7 +6,7 @@ Used from app.py:   SudokuBot().run()   (run it in a daemon thread)
 Optional environment settings:
   IRC_SERVER / IRC_HOST   IRC server (default: irc.hybridirc.com)
   IRC_PORT                IRC server port (default: 6697)
-  SUDOKU_NICK             Bot nickname (default: Sudoku)
+  SUDOKU_NICK             Bot nickname (default: DrSudoku)
   SUDOKU_ADMINS           Comma-separated admin nicks (default: Antonio,Starboy)
   SUDOKU_DB               Database file (default: sudoku.db) - separate from MagicalFairy
   IRC_SSL                 Set to 0 to disable TLS
@@ -62,7 +62,6 @@ POINTS = {
 }
 MISTAKE_PENALTY = 5      # points lost per mistake
 MAX_MISTAKES = 10        # more than this many mistakes = LOSE
-FILL_COOLDOWN = 10       # seconds nobody can !fill after a correct answer
 PENDING_TIMEOUT = 120    # seconds to pick a difficulty
 LEADERBOARD_SIZE = 10
 SPTS_COOLDOWN = 5        # seconds between !spts per channel
@@ -75,17 +74,68 @@ def empty_board() -> list[list[int]]:
     return [[0 for _ in range(9)] for _ in range(9)]
 
 
-def format_text_board(board: list[list[int]]) -> str:
-    """Render the grouped text format (unchanged)."""
+# ---------------- mIRC formatting helpers ----------------
+# \x02 = bold, \x03NN = colour, bare \x03 = end colour. Colour codes are always
+# two digits, so a number right after a colour code is never swallowed.
+PINK, RED, BLUE, BLACK = "13", "04", "12", "01"
+
+
+def style(text, color=None, bold=False):
+    """Wrap text in optional colour and/or bold."""
+    out = text
+    if color:
+        out = f"\x03{color}{out}\x03"
+    if bold:
+        out = f"\x02{out}\x02"
+    return out
+
+
+def logo():
+    """SUDOKU in bold capitals: S pink, U red, D blue, O pink, K red, U blue."""
+    colors = [PINK, RED, BLUE, PINK, RED, BLUE]
+    return "\x02" + "".join(style(ch, col) for ch, col in zip("SUDOKU", colors)) + "\x02"
+
+
+def choose_lines():
+    names = ("easy", "medium", "hard", "expert", "master", "extreme")
+    options = " ".join(style("!", PINK) + n for n in names)
+    return [logo(), "\x02" + style("CHOOSE", PINK) + " : " + options + "\x02"]
+
+
+def fill_usage_line():
+    cmd = (
+        "\x02" + "!" + f"\x03{BLACK}fill\x03" + " "
+        + f"\x03{PINK}A\x03" + f"\x03{RED}a\x03" + " " + f"\x03{BLUE}5\x03"
+        + "\x02"
+    )
+    return (
+        f"Use {cmd} ("
+        f"{style('column', PINK)}, {style('row', RED)}, {style('number', BLUE)})"
+    )
+
+
+def format_board(board: list[list[int]], givens: list[list[bool]]) -> str:
+    """
+    Same frame as always, now coloured: whole board bold, '?' red,
+    starting numbers normal, numbers filled in during play blue.
+    """
     lines = []
     for row_index, row in enumerate(board):
-        groups = [
-            " - ".join(str(value) if value else "?" for value in row[start : start + 3])
-            for start in (0, 3, 6)
-        ]
-        lines.append(f"| {' | '.join(groups)} |")
+        groups = []
+        for start in (0, 3, 6):
+            cells = []
+            for col in range(start, start + 3):
+                value = row[col]
+                if not value:
+                    cells.append(f"\x03{RED}?\x03")
+                elif givens[row_index][col]:
+                    cells.append(str(value))
+                else:
+                    cells.append(f"\x03{BLUE}{value}\x03")
+            groups.append(" - ".join(cells))
+        lines.append(f"\x02| {' | '.join(groups)} |\x02")
         if row_index in (2, 5):
-            lines.append("---------------------------------------")
+            lines.append("\x02---------------------------------------\x02")
     return "\n".join(lines)
 
 
@@ -354,7 +404,10 @@ class Game:
     clues: int = 0
     mistakes: int = 0
     pending_since: float = 0.0
-    fill_block_until: float = 0.0         # nobody can !fill until this time (monotonic)
+    contributors: list[str] = field(default_factory=list)   # everyone who made a correct fill
+    givens: list[list[bool]] = field(
+        default_factory=lambda: [[False for _ in range(9)] for _ in range(9)]
+    )
     board: list[list[int]] = field(default_factory=empty_board)
     solution: list[list[int]] = field(default_factory=empty_board)
 
@@ -379,7 +432,7 @@ class SudokuBot:
         except ValueError:
             LOG.warning("Invalid IRC_PORT; using 6697.")
             self.port = 6697
-        self.nick = os.getenv("SUDOKU_NICK", "Sudoku")
+        self.nick = os.getenv("SUDOKU_NICK", "DrSudoku")
         admins = os.getenv("SUDOKU_ADMINS", "Antonio,Starboy")
         self.admins = {a.strip().lower() for a in admins.split(",") if a.strip()}
         self.use_ssl = os.getenv("IRC_SSL", "1") != "0"
@@ -653,20 +706,12 @@ class SudokuBot:
             return
 
         if command == "!faqsudoku":
-            self.say(channel, "--- Sudoku FAQ ---")
-            self.say(channel, "!sudoku - start a game, then pick a level: "
-                              "!easy (50) !medium (100) !hard (200) !expert (300) !master (400) !extreme (500)")
-            self.say(channel, "!fill Aa 5 - put 5 in row A, column a (anyone can play)")
-            self.say(channel, "!su or .su - show the current board and game status")
-            self.say(channel, "!spts - points ranking")
-            self.say(channel, "!giveupgame - end the game (whoever started it, or an admin)")
-            self.say(channel, "!notation - how the coordinates work")
-            self.say(channel, f"Scoring: each mistake costs {MISTAKE_PENALTY} points. "
-                              f"More than {MAX_MISTAKES} mistakes = you LOSE.")
+            for line in self._faq_lines():
+                self.say(channel, line)
             return
 
         if command == "!notation":
-            self.say(channel, "Rows = A-I, columns = a-i. Example: !fill Bi 5 puts 5 in row B, column i.")
+            self.say(channel, "Columns = A-I, rows = a-i. Example: !fill Bi 5 puts 5 in column B, row i.")
             self.say(channel, f"Notation link: {self.notation_link}")
             return
 
@@ -691,11 +736,13 @@ class SudokuBot:
             if game.active:
                 self.say(channel, f"Game in progress (started by {game.player}). Use !su to see the board.")
             elif game.pending:
-                self.say(channel, f"{game.player} already started a game. Choose: "
-                                  "!easy !medium !hard !expert !master !extreme")
+                self.say(channel, f"{game.player} already started a game.")
+                for line in choose_lines():
+                    self.say(channel, line)
             else:
                 self.games[key] = Game(pending=True, player=sender, pending_since=time.monotonic())
-                self.say(channel, f"Hi {sender}, choose: !easy !medium !hard !expert !master !extreme")
+                for line in choose_lines():
+                    self.say(channel, line)
             return
 
         if command in DIFFICULTIES and game.pending:
@@ -703,7 +750,7 @@ class SudokuBot:
             return
 
         if command == "!fill" and game.active:
-            self._handle_fill(sender, channel, key, game, lower)
+            self._handle_fill(sender, channel, key, game, message)
             return
 
         if command == "!giveupgame" and (game.active or game.pending):
@@ -711,15 +758,14 @@ class SudokuBot:
                 self.notice(sender, "Only the player who started the game (or an admin) can give up.")
                 return
             if game.active:
-                self.say(channel, "Game over. Solution:")
-                self.say(channel, format_text_board(game.solution))
+                self.say(channel, f"{logo()} Game over. Solution:")
+                self.say(channel, format_board(game.solution, game.givens))
             else:
                 self.say(channel, "Game cancelled.")
             self.games[key] = Game()
 
     def _start_game(self, channel: str, key: str, game: Game, command: str) -> None:
         name = command[1:]
-        self.say(channel, f"Generating your {name} puzzle, one moment...")
         try:
             board, solution, clues = self.engine.generate(command)
         except Exception:
@@ -734,30 +780,34 @@ class SudokuBot:
             clues=clues,
             board=board,
             solution=solution,
+            givens=[[value != 0 for value in row] for row in board],
         )
         self.games[key] = new_game
         self.say(
             channel,
-            f"Game started ({name}, {clues} clues, worth {POINTS[name]} points)! "
-            "Use !fill Aa 5 (row, column, number). Anyone can play.",
+            f"{logo()} {style(name.capitalize() + ' Level', None, True)} Started | "
+            f"Total Points {style(str(POINTS[name]), BLUE, True)}",
         )
-        self.say(channel, format_text_board(new_game.board))
+        self.say(channel, fill_usage_line())
+        self.say(channel, format_board(new_game.board, new_game.givens))
 
     def _handle_fill(self, sender: str, channel: str, key: str, game: Game, lower: str) -> None:
-        now = time.monotonic()
-        if now < game.fill_block_until:
-            remaining = math.ceil(game.fill_block_until - now)
-            self.notice(sender, f"You can't use !fill for {remaining} more sec.")
-            return
-
-        args = lower.split()
+        args = lower.split()          # 'lower' is the original message text here
         coordinate = args[1] if len(args) > 1 else ""
         try:
             value = int(args[2]) if len(args) > 2 else 0
         except ValueError:
             value = 0
-        row = ROWS.find(coordinate[0]) if len(coordinate) >= 1 else -1
-        col = ROWS.find(coordinate[1]) if len(coordinate) >= 2 else -1
+        # Uppercase letter A-I = column, lowercase letter a-i = row.
+        # Normal order is column first ("Bi" = column B, row i); "iB" also works.
+        # If both letters are the same case, the first is the column.
+        row = col = -1
+        if len(coordinate) >= 2:
+            first, second = coordinate[0], coordinate[1]
+            if first.islower() and second.isupper():
+                row, col = ROWS.find(first), ROWS.find(second.lower())
+            else:
+                col, row = ROWS.find(first.lower()), ROWS.find(second.lower())
         if (
             len(args) != 3
             or len(coordinate) != 2
@@ -765,60 +815,106 @@ class SudokuBot:
             or col < 0
             or not 1 <= value <= 9
         ):
-            self.say(channel, "Use: !fill Aa 5 (row A-I, column a-i, number 1-9).")
+            self.say(channel, "Use: !fill Aa 5 (column A-I, row a-i, number 1-9).")
             return
         if game.board[row][col] != 0:
-            self.say(channel, f"{coordinate[0].upper()}{coordinate[1]} is already filled.")
+            cell = f"{coordinate[0].upper()}{coordinate[1]}"
+            self.say(channel, f"{style(cell, PINK)} is already filled.")
             return
 
         if game.solution[row][col] != value:
             game.mistakes += 1
             if game.mistakes > MAX_MISTAKES:
-                self.say(channel, f"Too many mistakes (more than {MAX_MISTAKES})! You LOSE. Solution:")
-                self.say(channel, format_text_board(game.solution))
+                self.say(
+                    channel,
+                    f"{logo()} Too many mistakes (more than {MAX_MISTAKES})! "
+                    f"You {style('LOSE', RED, True)}. Solution:",
+                )
+                self.say(channel, format_board(game.solution, game.givens))
                 self.games[key] = Game()
             else:
-                self.say(channel, f"Incorrect! Try again. (Mistakes: {game.mistakes}/{MAX_MISTAKES})")
+                self.say(
+                    channel,
+                    f"\u274c Incorrect! Try again. "
+                    f"({style('Mistakes', None, True)}: {style(f'{game.mistakes}/{MAX_MISTAKES}', PINK)})",
+                )
             return
 
         game.board[row][col] = value
-        game.fill_block_until = now + FILL_COOLDOWN
-        self.say(channel, "Correct!")
-        self.say(channel, format_text_board(game.board))
+        if sender.lower() not in [name.lower() for name in game.contributors]:
+            game.contributors.append(sender)
+        self.say(channel, f"{logo()} Correct \U0001f389")
+        self.say(channel, format_board(game.board, game.givens))
 
         if all(cell != 0 for line in game.board for cell in line):
-            earned = self._points_now(game)
-            result = (
-                "no mistakes!"
-                if game.mistakes == 0
-                else f"{game.mistakes} mistake(s), -{game.mistakes * MISTAKE_PENALTY} points."
-            )
-            try:
-                total = self.store.add_points(sender, earned)
-                self.say(channel, f"WINNER! Congrats {sender}! ({result}) +{earned} points | Total: {total} points")
-            except Exception:
-                LOG.exception("Could not save points.")
-                self.say(channel, f"WINNER! Congrats {sender}! ({result}) +{earned} points (could not be saved)")
+            self._announce_winners(channel, game)
             self.games[key] = Game()
+
+    def _announce_winners(self, channel: str, game: Game) -> None:
+        base = POINTS.get(game.difficulty or "", 0)
+        final = self._points_now(game)
+        deducted = base - final
+        failed = False
+        self.say(channel, f"{logo()} Winners:")
+        for index, name in enumerate(game.contributors, start=1):
+            try:
+                self.store.add_points(name, final)
+            except Exception:
+                LOG.exception("Could not save points for %s.", name)
+                failed = True
+            b = lambda t: style(t, None, True)
+            self.say(
+                channel,
+                f"[{index}] {b(name)}\n"
+                f" {b('G')}ame {b('p')}oints: {style(str(base), PINK, True)}\n"
+                f" {b('M')}istakes: {style(str(game.mistakes), PINK, True)}\n"
+                f" {b('D')}educted: {style(str(deducted), PINK, True)} {b('p')}oints\n"
+                f" {b('F')}inal {b('p')}oints: {style(str(final), PINK, True)}",
+            )
+        if failed:
+            self.say(channel, "Some points could not be saved. Please tell an admin.")
+
+    @staticmethod
+    def _faq_lines() -> list[str]:
+        cmd = lambda t: style(t, PINK, True)
+        levels = " ".join(
+            f"{cmd('!' + name)} ({POINTS[name]})" for name in POINTS
+        )
+        return [
+            f"{logo()} {style('FAQ', None, True)}",
+            f"\U0001f3ae {cmd('!sudoku')} - start a game, then pick a level",
+            f"\U0001f3af Levels: {levels}",
+            f"\u270f\ufe0f {cmd('!fill Aa 5')} - put 5 in column A, row a (anyone can play)",
+            f"\U0001f4cb {cmd('!su')} or {cmd('.su')} - show the current board and game status",
+            f"\U0001f3c6 {cmd('!spts')} - points ranking",
+            f"\U0001f4d6 {cmd('!notation')} - how the coordinates work",
+            f"\U0001f3f3\ufe0f {cmd('!giveupgame')} - end the game (whoever started it, or an admin)",
+            f"\u26a0\ufe0f {style('Scoring', None, True)}: each mistake costs {MISTAKE_PENALTY} points. "
+            f"More than {MAX_MISTAKES} mistakes = you {style('LOSE', RED, True)}.",
+        ]
 
     def _show_status(self, channel: str, game: Game) -> None:
         if game.active:
+            b = lambda t: style(t, None, True)
             self.say(
                 channel,
-                f"Sudoku ({game.difficulty}) | started by {game.player} | "
-                f"Mistakes: {game.mistakes}/{MAX_MISTAKES} | Worth now: {self._points_now(game)} points",
+                f"{logo()} | {b('Level:')} {style((game.difficulty or '').upper(), PINK)} | "
+                f"{b('Mistakes')} {style(f'{game.mistakes}/{MAX_MISTAKES}', PINK)} | "
+                f"{b('Total :')} {style(f'{self._points_now(game)} points', PINK)}",
             )
-            self.say(channel, format_text_board(game.board))
+            self.say(channel, format_board(game.board, game.givens))
         elif game.pending:
-            self.say(channel, f"{game.player} is choosing a difficulty: "
-                              "!easy !medium !hard !expert !master !extreme")
+            self.say(channel, f"{game.player} is choosing a difficulty.")
+            for line in choose_lines():
+                self.say(channel, line)
         else:
             self.say(channel, "No game running. Start one with !sudoku.")
 
     def _show_ranking(self, sender: str, channel: str) -> None:
         now = time.monotonic()
         key = channel.lower()
-        if now - self.last_spts.get(key, 0.0) < SPTS_COOLDOWN:
+        last = self.last_spts.get(key)
+        if last is not None and now - last < SPTS_COOLDOWN:
             return
         self.last_spts[key] = now
         try:
@@ -830,7 +926,7 @@ class SudokuBot:
         if not ranking:
             self.say(channel, "No points yet. Win a game to get on the board!")
             return
-        self.say(channel, f"--- Sudoku Top {LEADERBOARD_SIZE} ---")
+        self.say(channel, f"{logo()} Top {LEADERBOARD_SIZE}")
         for i, row in enumerate(ranking[:LEADERBOARD_SIZE], start=1):
             self.say(channel, f"{i}. {row['nick']} - {row['points']} pts ({row['wins']} wins)")
         for i, row in enumerate(ranking, start=1):
