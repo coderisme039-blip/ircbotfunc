@@ -64,6 +64,7 @@ MISTAKE_PENALTY = 5      # points lost per mistake
 MAX_MISTAKES = 10        # more than this many mistakes = LOSE
 PENDING_TIMEOUT = 120    # seconds to pick a difficulty
 LEADERBOARD_SIZE = 10
+MAX_BATCH = 30           # most guesses accepted in one !fill line
 SPTS_COOLDOWN = 5        # seconds between !spts per channel
 
 CHANNEL_RE = re.compile(r"^#[^\s,\x07\x00-\x1f]{1,49}$")
@@ -111,6 +112,14 @@ def fill_usage_line():
     return (
         f"Use {cmd} ("
         f"{style('row', PINK)}, {style('column', RED)}, {style('number', BLUE)})"
+    )
+
+
+def pro_tip_line():
+    return (
+        f"\U0001f4a1 {style('Pro tip', None, True)}: "
+        f"{style('!fill Aa 5, Ab 2, ...', PINK, True)} "
+        "- send many guesses in one line, the board is shown only once"
     )
 
 
@@ -789,42 +798,72 @@ class SudokuBot:
             f"Total Points {style(str(POINTS[name]), BLUE, True)}",
         )
         self.say(channel, fill_usage_line())
+        self.say(channel, pro_tip_line())
         self.say(channel, format_board(new_game.board, new_game.givens))
 
-    def _handle_fill(self, sender: str, channel: str, key: str, game: Game, lower: str) -> None:
-        args = lower.split()          # 'lower' is the original message text here
-        coordinate = args[1] if len(args) > 1 else ""
+    FILL_USAGE = "Use: !fill Aa 5 (row A-I, column a-i, number 1-9)."
+
+    @staticmethod
+    def _parse_guess(coordinate: str, value_text: str):
+        """Return (row, col, value) or None if the guess is malformed."""
         try:
-            value = int(args[2]) if len(args) > 2 else 0
+            value = int(value_text)
         except ValueError:
-            value = 0
-        # First letter = row (A-I), second letter = column (a-i); case does not matter.
-        row = ROWS.find(coordinate[0].lower()) if len(coordinate) >= 1 else -1
-        col = ROWS.find(coordinate[1].lower()) if len(coordinate) >= 2 else -1
-        if (
-            len(args) != 3
-            or len(coordinate) != 2
-            or row < 0
-            or col < 0
-            or not 1 <= value <= 9
-        ):
-            self.say(channel, "Use: !fill Aa 5 (row A-I, column a-i, number 1-9).")
+            return None
+        if len(coordinate) != 2:
+            return None
+        row = ROWS.find(coordinate[0].lower())
+        col = ROWS.find(coordinate[1].lower())
+        if row < 0 or col < 0 or not 1 <= value <= 9:
+            return None
+        return row, col, value
+
+    @staticmethod
+    def _label(coordinate: str) -> str:
+        return f"{coordinate[0].upper()}{coordinate[1:]}" if coordinate else coordinate
+
+    def _handle_fill(self, sender: str, channel: str, key: str, game: Game, raw: str) -> None:
+        # "!fill Aa 5" or several at once: "!fill Aa 5, Ab 2, Ac 9"
+        tokens = raw.replace(",", " ").split()[1:]
+        if not tokens or len(tokens) % 2:
+            self.say(channel, self.FILL_USAGE)
             return
+        pairs = list(zip(tokens[0::2], tokens[1::2]))
+        if len(pairs) > MAX_BATCH:
+            self.say(channel, f"Too many guesses at once (max {MAX_BATCH}).")
+            return
+        if len(pairs) == 1:
+            self._fill_single(sender, channel, key, game, pairs[0][0], pairs[0][1])
+        else:
+            self._fill_multi(sender, channel, key, game, pairs)
+
+    def _lose(self, channel: str, key: str, game: Game) -> None:
+        self.say(
+            channel,
+            f"{logo()} Too many mistakes (more than {MAX_MISTAKES})! "
+            f"You {style('LOSE', RED, True)}. Solution:",
+        )
+        self.say(channel, format_board(game.solution, game.givens))
+        self.games[key] = Game()
+
+    def _add_contributor(self, game: Game, sender: str) -> None:
+        if sender.lower() not in [name.lower() for name in game.contributors]:
+            game.contributors.append(sender)
+
+    def _fill_single(self, sender, channel, key, game, coordinate, value_text) -> None:
+        parsed = self._parse_guess(coordinate, value_text)
+        if parsed is None:
+            self.say(channel, self.FILL_USAGE)
+            return
+        row, col, value = parsed
         if game.board[row][col] != 0:
-            cell = f"{coordinate[0].upper()}{coordinate[1]}"
-            self.say(channel, f"{style(cell, PINK)} is already filled.")
+            self.say(channel, f"{style(self._label(coordinate), PINK)} is already filled.")
             return
 
         if game.solution[row][col] != value:
             game.mistakes += 1
             if game.mistakes > MAX_MISTAKES:
-                self.say(
-                    channel,
-                    f"{logo()} Too many mistakes (more than {MAX_MISTAKES})! "
-                    f"You {style('LOSE', RED, True)}. Solution:",
-                )
-                self.say(channel, format_board(game.solution, game.givens))
-                self.games[key] = Game()
+                self._lose(channel, key, game)
             else:
                 self.say(
                     channel,
@@ -834,9 +873,57 @@ class SudokuBot:
             return
 
         game.board[row][col] = value
-        if sender.lower() not in [name.lower() for name in game.contributors]:
-            game.contributors.append(sender)
+        self._add_contributor(game, sender)
         self.say(channel, f"{logo()} Correct \U0001f389")
+        self.say(channel, format_board(game.board, game.givens))
+        if all(cell != 0 for line in game.board for cell in line):
+            self._announce_winners(channel, game)
+            self.games[key] = Game()
+
+    def _fill_multi(self, sender, channel, key, game, pairs) -> None:
+        correct, wrong, filled, invalid = [], [], [], []
+        for coordinate, value_text in pairs:
+            parsed = self._parse_guess(coordinate, value_text)
+            if parsed is None:
+                invalid.append(coordinate)
+                continue
+            row, col, value = parsed
+            label = self._label(coordinate)
+            if game.board[row][col] != 0:
+                filled.append(label)
+            elif game.solution[row][col] != value:
+                game.mistakes += 1
+                wrong.append(label)
+                if game.mistakes > MAX_MISTAKES:
+                    self._lose(channel, key, game)
+                    return
+            else:
+                game.board[row][col] = value
+                correct.append(label)
+
+        if not (correct or wrong or filled):
+            self.say(channel, self.FILL_USAGE)
+            return
+
+        if correct:
+            self._add_contributor(game, sender)
+
+        def group(labels):
+            return style("[" + ", ".join(labels) + "]", PINK)
+
+        self.say(channel, logo())
+        if correct:
+            self.say(channel, f"\U0001f389 {style('Correct', None, True)} {group(correct)}")
+        if wrong:
+            self.say(
+                channel,
+                f"\u274c {style('Incorrect', None, True)} {group(wrong)} "
+                f"({style('Mistakes', None, True)}: {style(f'{game.mistakes}/{MAX_MISTAKES}', PINK)})",
+            )
+        if filled:
+            self.say(channel, f"{style('Already filled', None, True)} {group(filled)}")
+        if invalid:
+            self.say(channel, f"{style('Invalid', None, True)} {group(invalid)}")
         self.say(channel, format_board(game.board, game.givens))
 
         if all(cell != 0 for line in game.board for cell in line):
@@ -858,11 +945,11 @@ class SudokuBot:
             b = lambda t: style(t, None, True)
             self.say(
                 channel,
-                f"[{index}] {b(name)}\n"
+                f"[{index}] {b(name)} \U0001f389\n"
                 f" {b('G')}ame {b('p')}oints: {style(str(base), PINK, True)}\n"
-                f" {b('M')}istakes: {style(str(game.mistakes), PINK, True)}\n"
-                f" {b('D')}educted: {style(str(deducted), PINK, True)} {b('p')}oints\n"
-                f" {b('F')}inal {b('p')}oints: {style(str(final), PINK, True)}",
+                f"\u274c {b('M')}istakes: {style(str(game.mistakes), PINK, True)}\n"
+                f"\u2796 {b('D')}educted: {style(str(deducted), PINK, True)} {b('p')}oints\n"
+                f"\U0001f31f {b('F')}inal {b('p')}oints: {style(str(final), PINK, True)}",
             )
         if failed:
             self.say(channel, "Some points could not be saved. Please tell an admin.")
@@ -878,6 +965,7 @@ class SudokuBot:
             f"\U0001f3ae {cmd('!sudoku')} - start a game, then pick a level",
             f"\U0001f3af Levels: {levels}",
             f"\u270f\ufe0f {cmd('!fill Aa 5')} - put 5 in row A, column a (anyone can play)",
+            pro_tip_line(),
             f"\U0001f4cb {cmd('!su')} or {cmd('.su')} - show the current board and game status",
             f"\U0001f3c6 {cmd('!spts')} - points ranking",
             f"\U0001f4d6 {cmd('!notation')} - how the coordinates work",
