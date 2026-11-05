@@ -1007,12 +1007,31 @@ class SudokuBot:
         if not ranking:
             self.say(channel, "No points yet. Win a game to get on the board!")
             return
-        self.say(channel, f"{logo()} Top {LEADERBOARD_SIZE}")
-        for i, row in enumerate(ranking[:LEADERBOARD_SIZE], start=1):
-            self.say(channel, f"{i}. {row['nick']} - {row['points']} pts ({row['wins']} wins)")
+        bold = lambda t: style(t, None, True)
+        entries = [
+            f"{i}. {bold(row['nick'])} {style(str(row['points']), PINK, True)}"
+            for i, row in enumerate(ranking[:LEADERBOARD_SIZE], start=1)
+        ]
+        # One line like: SUDOKU Top 10 (points): 1. Name 100 | 2. Name 90 | ...
+        # (split over extra lines only if it would get too long for IRC)
+        line = f"{logo()} Top {LEADERBOARD_SIZE} (points):"
+        for entry in entries:
+            piece = f" {entry}" if line.endswith(":") else f" | {entry}"
+            if len(line.encode("utf-8")) + len(piece.encode("utf-8")) > 380:
+                self.say(channel, line)
+                line = entry
+            else:
+                line += piece
+        self.say(channel, line)
+
         for i, row in enumerate(ranking, start=1):
-            if row["user_id"] == sender.lower() and i > LEADERBOARD_SIZE:
-                self.say(channel, f"Your rank: #{i} - {row['points']} pts ({row['wins']} wins)")
+            if row["user_id"] == sender.lower():
+                points_text = format(row["points"], ",")
+                self.say(
+                    channel,
+                    f"\U0001f464 {bold('Your Rank')}: {style('#' + str(i), PINK, True)} | "
+                    f"\u2b50 {style(points_text, PINK, True)} {bold('Points')}",
+                )
                 break
 
     def _expire_pending(self) -> None:
