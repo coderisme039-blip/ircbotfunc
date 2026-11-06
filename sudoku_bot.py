@@ -112,14 +112,24 @@ def choose_lines():
     return [logo(), "\x02" + style("CHOOSE", PINK) + " : " + options + "\x02"]
 
 
+def cell_label(row: int, col: int) -> str:
+    """Cell shown in 1-9 1-9 notation: row digit pink, column digit red (like A / a)."""
+    return style(str(row + 1), PINK) + " " + style(str(col + 1), RED)
+
+
 def fill_usage_line():
-    cmd = (
+    letters = (
         "\x02" + "!fill" + " "
         + f"\x03{PINK}A\x03" + f"\x03{RED}a\x03" + " " + f"\x03{BLUE}5\x03"
         + "\x02"
     )
+    numbers = (
+        "\x02" + "!fill" + " "
+        + f"\x03{PINK}1\x03" + f"\x03{RED}1\x03" + " " + f"\x03{BLUE}5\x03"
+        + "\x02"
+    )
     return (
-        f"Use {cmd} ("
+        f"Use {letters} or {numbers} ("
         f"{style('row', PINK)}, {style('column', RED)}, {style('number', BLUE)})"
     )
 
@@ -742,7 +752,7 @@ class SudokuBot:
             return
 
         if command == "!notation":
-            self.say(channel, "Rows = A-I, columns = a-i. Example: !fill Bi 5 puts 5 in row B, column i.")
+            self.say(channel, "Rows = A-I or 1-9, columns = a-i or 1-9. Example: !fill Bi 5 or !fill 29 5 puts 5 in row B (2), column i (9).")
             self.say(channel, f"Notation link: {self.notation_link}")
             return
 
@@ -827,10 +837,17 @@ class SudokuBot:
         self.say(channel, pro_tip_line())
         self.say(channel, format_board(new_game.board, new_game.givens))
 
-    FILL_USAGE = "Use: !fill Aa 5 (row A-I, column a-i, number 1-9)."
+    FILL_USAGE = "Use: !fill Aa 5 or !fill 11 5 (row A-I or 1-9, column a-i or 1-9, number 1-9)."
 
     @staticmethod
-    def _parse_guess(coordinate: str, value_text: str):
+    def _axis(ch: str) -> int:
+        """One coordinate character -> 0-8. Accepts 1-9 and letters A-I / a-i."""
+        if ch in "123456789":
+            return int(ch) - 1
+        return ROWS.find(ch.lower()) if ch.lower() in ROWS else -1
+
+    @classmethod
+    def _parse_guess(cls, coordinate: str, value_text: str):
         """Return (row, col, value) or None if the guess is malformed."""
         try:
             value = int(value_text)
@@ -838,23 +855,40 @@ class SudokuBot:
             return None
         if len(coordinate) != 2:
             return None
-        row = ROWS.find(coordinate[0].lower())
-        col = ROWS.find(coordinate[1].lower())
+        row = cls._axis(coordinate[0])
+        col = cls._axis(coordinate[1])
         if row < 0 or col < 0 or not 1 <= value <= 9:
             return None
         return row, col, value
 
     @staticmethod
-    def _label(coordinate: str) -> str:
-        return f"{coordinate[0].upper()}{coordinate[1:]}" if coordinate else coordinate
+    def _split_guesses(tokens: list[str]) -> list[tuple[str, str]]:
+        """
+        Turn the words after !fill into (coordinate, number) pairs. Accepts
+        "Aa 5", "11 5" and "1 1 5" in any mix, e.g. "Aa 5, 12 2, 3 3 9".
+        """
+        guesses: list[tuple[str, str]] = []
+        i = 0
+        while i < len(tokens):
+            token = tokens[i]
+            if len(token) == 2:
+                guesses.append((token, tokens[i + 1] if i + 1 < len(tokens) else ""))
+                i += 2
+            elif len(token) == 1 and i + 2 < len(tokens) and len(tokens[i + 1]) == 1:
+                guesses.append((token + tokens[i + 1], tokens[i + 2]))
+                i += 3
+            else:
+                guesses.append((token, ""))   # unreadable, reported as invalid
+                i += 1
+        return guesses
 
     def _handle_fill(self, sender: str, channel: str, key: str, game: Game, raw: str) -> None:
-        # "!fill Aa 5" or several at once: "!fill Aa 5, Ab 2, Ac 9"
+        # "!fill Aa 5", "!fill 11 5", "!fill 1 1 5" or several at once: "!fill Aa 5, 12 2, Ac 9"
         tokens = raw.replace(",", " ").split()[1:]
-        if not tokens or len(tokens) % 2:
+        if not tokens:
             self.say(channel, self.FILL_USAGE)
             return
-        pairs = list(zip(tokens[0::2], tokens[1::2]))
+        pairs = self._split_guesses(tokens)
         if len(pairs) > MAX_BATCH:
             self.say(channel, f"Too many guesses at once (max {MAX_BATCH}).")
             return
@@ -889,7 +923,7 @@ class SudokuBot:
             return
         row, col, value = parsed
         if game.board[row][col] != 0:
-            self.say(channel, f"{style(self._label(coordinate), PINK)} is already filled.")
+            self.say(channel, f"{cell_label(row, col)} is already filled.")
             return
 
         if game.solution[row][col] != value:
@@ -918,10 +952,10 @@ class SudokuBot:
         for coordinate, value_text in pairs:
             parsed = self._parse_guess(coordinate, value_text)
             if parsed is None:
-                invalid.append(coordinate)
+                invalid.append(style(coordinate, PINK))
                 continue
             row, col, value = parsed
-            label = self._label(coordinate)
+            label = cell_label(row, col)
             if game.board[row][col] != 0:
                 filled.append(label)
             elif game.solution[row][col] != value:
@@ -941,7 +975,7 @@ class SudokuBot:
             return
 
         def group(labels):
-            return style("[" + ", ".join(labels) + "]", PINK)
+            return "[" + " | ".join(labels) + "]"
 
         self.say(channel, logo())
         if correct:
@@ -1008,6 +1042,7 @@ class SudokuBot:
             f"\U0001f3af Levels: {levels} within {style('20s', PINK)}",
             f"\U0001f522 {style('Points', None, True)} are as per {style('each', PINK)} guess.",
             f"\u270f\ufe0f {cmd('!fill Aa 5')} - put 5 in row A, column a (anyone can play)",
+            f"\u270f\ufe0f {cmd('!fill 11 5')} - put 5 in row 1, column 1 (1-9 works for A-I and a-i)",
             pro_tip_line(),
             f"\U0001f4cb {cmd('!su')} or {cmd('.su')} - show the current board and game status",
             f"\U0001f3c6 {cmd('!spts')} - points ranking",
