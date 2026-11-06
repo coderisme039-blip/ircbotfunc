@@ -112,9 +112,15 @@ def choose_lines():
     return [logo(), "\x02" + style("CHOOSE", PINK) + " : " + options + "\x02"]
 
 
-def cell_label(row: int, col: int) -> str:
-    """Cell shown in 1-9 1-9 notation: row digit pink, column digit red (like A / a)."""
-    return style(str(row + 1), PINK) + " " + style(str(col + 1), RED)
+def cell_label(row: int, col: int, notation: str = "alpha") -> str:
+    """
+    Show a cell in the same notation the player typed:
+      letters ("alpha"): row letter pink, column letter red, e.g. Ia
+      numbers ("num"):   row digit pink, column digit red, e.g. 1 5
+    """
+    if notation == "num":
+        return style(str(row + 1), PINK) + " " + style(str(col + 1), RED)
+    return style(ROWS[row].upper(), PINK) + style(ROWS[col], RED)
 
 
 def fill_usage_line():
@@ -840,11 +846,15 @@ class SudokuBot:
     FILL_USAGE = "Use: !fill Aa 5 or !fill 11 5 (row A-I or 1-9, column a-i or 1-9, number 1-9)."
 
     @staticmethod
-    def _axis(ch: str) -> int:
-        """One coordinate character -> 0-8. Accepts 1-9 and letters A-I / a-i."""
-        if ch in "123456789":
-            return int(ch) - 1
-        return ROWS.find(ch.lower()) if ch.lower() in ROWS else -1
+    def _notation_of(coordinate: str):
+        """'alpha' for two letters (Aa), 'num' for two digits (11), None for anything else (e.g. A1)."""
+        if len(coordinate) != 2:
+            return None
+        if all(ch in "0123456789" for ch in coordinate):
+            return "num"
+        if all(ch.isascii() and ch.isalpha() for ch in coordinate):
+            return "alpha"
+        return None
 
     @classmethod
     def _parse_guess(cls, coordinate: str, value_text: str):
@@ -853,10 +863,13 @@ class SudokuBot:
             value = int(value_text)
         except ValueError:
             return None
-        if len(coordinate) != 2:
+        notation = cls._notation_of(coordinate)
+        if notation == "num":
+            row, col = int(coordinate[0]) - 1, int(coordinate[1]) - 1
+        elif notation == "alpha":
+            row, col = ROWS.find(coordinate[0].lower()), ROWS.find(coordinate[1].lower())
+        else:
             return None
-        row = cls._axis(coordinate[0])
-        col = cls._axis(coordinate[1])
         if row < 0 or col < 0 or not 1 <= value <= 9:
             return None
         return row, col, value
@@ -889,13 +902,19 @@ class SudokuBot:
             self.say(channel, self.FILL_USAGE)
             return
         pairs = self._split_guesses(tokens)
+        # Letters only or numbers only in one line - no mixing (e.g. "11 1, ab 2" or "A1 5").
+        styles = {self._notation_of(c) for c, _ in pairs if len(c) == 2}
+        if None in styles or len(styles) > 1:
+            self.say(channel, self.FILL_USAGE)
+            return
+        notation = styles.pop() if styles else "alpha"
         if len(pairs) > MAX_BATCH:
             self.say(channel, f"Too many guesses at once (max {MAX_BATCH}).")
             return
         if len(pairs) == 1:
-            self._fill_single(sender, channel, key, game, pairs[0][0], pairs[0][1])
+            self._fill_single(sender, channel, key, game, pairs[0][0], pairs[0][1], notation)
         else:
-            self._fill_multi(sender, channel, key, game, pairs)
+            self._fill_multi(sender, channel, key, game, pairs, notation)
 
     def _lose(self, channel: str, key: str, game: Game) -> None:
         self.say(
@@ -916,14 +935,14 @@ class SudokuBot:
         entry["mistakes"] += wrong
         game.correct_count += correct
 
-    def _fill_single(self, sender, channel, key, game, coordinate, value_text) -> None:
+    def _fill_single(self, sender, channel, key, game, coordinate, value_text, notation="alpha") -> None:
         parsed = self._parse_guess(coordinate, value_text)
         if parsed is None:
             self.say(channel, self.FILL_USAGE)
             return
         row, col, value = parsed
         if game.board[row][col] != 0:
-            self.say(channel, f"{cell_label(row, col)} is already filled.")
+            self.say(channel, f"{cell_label(row, col, notation)} is already filled.")
             return
 
         if game.solution[row][col] != value:
@@ -947,7 +966,7 @@ class SudokuBot:
             self._announce_winners(channel, game)
             self.games[key] = Game()
 
-    def _fill_multi(self, sender, channel, key, game, pairs) -> None:
+    def _fill_multi(self, sender, channel, key, game, pairs, notation="alpha") -> None:
         correct, wrong, filled, invalid = [], [], [], []
         for coordinate, value_text in pairs:
             parsed = self._parse_guess(coordinate, value_text)
@@ -955,7 +974,7 @@ class SudokuBot:
                 invalid.append(style(coordinate, PINK))
                 continue
             row, col, value = parsed
-            label = cell_label(row, col)
+            label = cell_label(row, col, notation)
             if game.board[row][col] != 0:
                 filled.append(label)
             elif game.solution[row][col] != value:
@@ -975,7 +994,8 @@ class SudokuBot:
             return
 
         def group(labels):
-            return "[" + " | ".join(labels) + "]"
+            separator = ", " if notation == "alpha" else " | "
+            return "[" + separator.join(labels) + "]"
 
         self.say(channel, logo())
         if correct:
