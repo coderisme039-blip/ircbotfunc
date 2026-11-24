@@ -59,7 +59,7 @@ FAIRY_STAR = "🌟"                      # the official reward emoji
 ADMIN_NICKS = {"antonio", "starboy", "sasha", "juggu", "antoniox"}
 
 # Line ChiefOper sends as a NOTICE to users who join #ChatWithWorld, #Games and #global
-WEB_CLIENT_MSG = ("Visit https://worldofantonio.vercel.app and try out our web-based IRC client"
+WEB_CLIENT_MSG = ("Visit https://worldofantonio.netlify.app and try out our web-based IRC client"
                   "—connect, chat, and experience IRC right from your browser!")
 WEB_CLIENT_CHANNELS = ("#chatwithworld", "#games", "#global")
 
