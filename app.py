@@ -54,6 +54,15 @@ FAIRY_NOTICE_COOLDOWN = 10            # seconds between "no star"/"protected sta
 FAIRY_CMD_COOLDOWN = 5                # seconds per user between !top / !mystars
 FAIRY_STAR = "🌟"                      # the official reward emoji
 
+# Nicks allowed to use the admin commands of MrLogger (!alluser) and MagicalFairy
+# (!stargame, !fminmin, !fmaxmin, !fcsec). Matched by nickname, case-insensitive.
+ADMIN_NICKS = {"antonio", "starboy", "sasha", "juggu", "antoniox"}
+
+# Extra line ChiefOper adds to its welcome in #ChatWithWorld, #Games and #global
+WEB_CLIENT_MSG = ("Visit https://worldofantonio.vercel.app/ and try out our web-based IRC client"
+                  "—connect, chat, and experience IRC right from your browser!")
+WEB_CLIENT_CHANNELS = ("#chatwithworld", "#games", "#global")
+
 # ============================================================
 # WEB SERVER (for Render health checks / keep-alive)
 # ============================================================
@@ -804,6 +813,9 @@ class ChiefOper(IRCBot):
                         f"rules or !usercmd- to see everything I can do."
                     )
 
+                if chan_lower in WEB_CLIENT_CHANNELS:
+                    self.privmsg(target_chan, WEB_CLIENT_MSG)
+
         if parts[1] == "PRIVMSG" and len(parts) >= 4:
             sender_prefix = parts[0]
             sender_nick = sender_prefix.split('!')[0].lstrip(':')
@@ -1320,15 +1332,66 @@ class MrLogger(IRCBot):
         self.lock = threading.Lock()
         self.data = self.load_data()
 
+    JOIN_WINDOW_DAYS = 30
+
     def load_data(self):
         with self.lock:
+            data = {"logs": {}, "mailbox": {}}
             if os.path.exists(self.log_file):
                 try:
                     with open(self.log_file, 'r') as f:
-                        return json.load(f)
+                        data = json.load(f)
                 except Exception:
-                    return {"logs": {}, "mailbox": {}}
-            return {"logs": {}, "mailbox": {}}
+                    data = {"logs": {}, "mailbox": {}}
+            data.setdefault("logs", {})
+            data.setdefault("mailbox", {})
+            data.setdefault("joins", {})   # {channel: {nick_lower: [nick, last_seen_epoch]}}
+            return data
+
+    def _note_presence(self, channel, nick):
+        """Remember that `nick` was in `channel` just now (join, name list, or spoke)."""
+        if not channel.startswith("#") or nick.lower() == self.nickname.lower():
+            return
+        users = self.data["joins"].setdefault(channel.lower(), {})
+        users[nick.lower()] = [nick, time.time()]
+
+    def _prune_joins(self):
+        cutoff = time.time() - self.JOIN_WINDOW_DAYS * 86400
+        for chan in list(self.data["joins"]):
+            users = self.data["joins"][chan]
+            for key in list(users):
+                if users[key][1] < cutoff:
+                    del users[key]
+            if not users:
+                del self.data["joins"][chan]
+
+    def _handle_alluser(self, sender_nick, target, message):
+        """!alluser #channel (admins only): nicks seen joining that channel in the last 30 days."""
+        if sender_nick.lower() not in ADMIN_NICKS:
+            return
+        reply_to = target if target.startswith("#") else sender_nick
+        args = message.split()
+        if len(args) != 2 or not args[1].startswith("#"):
+            self.privmsg(reply_to, "Usage: !alluser #channel")
+            return
+        channel = args[1]
+        self._prune_joins()
+        users = self.data["joins"].get(channel.lower(), {})
+        if not users:
+            self.privmsg(reply_to, f"No joins recorded for {channel} in the last {self.JOIN_WINDOW_DAYS} days")
+            return
+        names = sorted((entry[0] for entry in users.values()), key=str.lower)
+        self.privmsg(reply_to, f"Users who joined {channel} in the last {self.JOIN_WINDOW_DAYS} days ({len(names)}):")
+        line = ""
+        for name in names:
+            piece = name if not line else f", {name}"
+            if len((line + piece).encode("utf-8")) > 380:
+                self.privmsg(reply_to, line)
+                line = name
+            else:
+                line += piece
+        if line:
+            self.privmsg(reply_to, line)
 
     def save_data(self):
         with self.lock:
@@ -1357,6 +1420,15 @@ class MrLogger(IRCBot):
             target_chan = parts[2].lstrip(':') if len(parts) > 2 else CHANNELS[0]
             if sender_nick != self.nickname:
                 self.check_mailbox(sender_nick, target_chan if target_chan.startswith("#") else CHANNELS[0])
+                self._note_presence(target_chan, sender_nick)
+                self.save_data()
+
+        # Name list sent when the bot joins a channel: everyone already inside counts as present now.
+        if parts[1] == "353" and len(parts) >= 6:
+            names = " ".join(parts[5:]).lstrip(':').split()
+            for entry in names:
+                self._note_presence(parts[4], entry.lstrip("@+%&~"))
+            self.save_data()
 
         if parts[1] == "PRIVMSG" and len(parts) >= 4:
             sender_nick = parts[0].split('!')[0].lstrip(':')
@@ -1364,6 +1436,12 @@ class MrLogger(IRCBot):
             message = " ".join(parts[3:])
             if message.startswith(':'):
                 message = message[1:]
+
+            if message.split()[:1] and message.split()[0].lower() == "!alluser":
+                self._handle_alluser(sender_nick, target, message)
+
+            if target.startswith("#"):
+                self._note_presence(target, sender_nick)
 
             if sender_nick != self.nickname:
                 self.check_mailbox(sender_nick, target if target.startswith("#") else CHANNELS[0])
@@ -1598,6 +1676,11 @@ class MagicalFairy(IRCBot):
         self._notice_lock = threading.Lock()
         self._game_started = False
         self._game_start_lock = threading.Lock()
+        # Live settings (admins can change them with !stargame / !fminmin / !fmaxmin / !fcsec)
+        self.game_enabled = True
+        self.min_minutes = FAIRY_MIN_MINUTES
+        self.max_minutes = FAIRY_MAX_MINUTES
+        self.catch_seconds = FAIRY_CATCH_SECONDS
 
     # ---------------- formatting ----------------
     @staticmethod
@@ -1620,11 +1703,125 @@ class MagicalFairy(IRCBot):
             storage.init_storage()
         except Exception as exc:
             print(f"[{self.nickname}] Storage init failed (will retry on use): {exc}")
+        self._load_settings()
         threading.Thread(target=self._game_loop, daemon=True).start()
 
+    # ---------------- admin-adjustable settings ----------------
+    @staticmethod
+    def _parse_number(text):
+        try:
+            value = float(text)
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
+
+    def _save_setting(self, key, value):
+        try:
+            storage.set_meta(key, value)
+        except Exception as exc:
+            print(f"[{self.nickname}] Could not save setting {key}: {exc}")
+
+    def _load_settings(self):
+        """Apply settings an admin saved earlier; otherwise the defaults stay (40 / 60 / 60)."""
+        def read(key):
+            try:
+                return self._parse_number(storage.get_meta(key))
+            except Exception:
+                return None
+
+        low, high, secs = read("fairy_min_minutes"), read("fairy_max_minutes"), read("fairy_catch_seconds")
+        new_min = low if low and low > 0 else self.min_minutes
+        new_max = high if high and high > 0 else self.max_minutes
+        if new_min <= new_max:
+            self.min_minutes, self.max_minutes = new_min, new_max
+        if secs and secs >= 5:
+            self.catch_seconds = secs
+        try:
+            if storage.get_meta("fairy_enabled") == "0":
+                self.game_enabled = False
+        except Exception:
+            pass
+
+    def _set_enabled(self, on):
+        self.game_enabled = on
+        self._save_setting("fairy_enabled", "1" if on else "0")
+        if on:
+            self._schedule_next()          # resume: the next star comes after a fresh wait
+        else:
+            cancelled = False
+            with self.state_lock:
+                star = self.active
+                if star is not None and not star["resolved"]:
+                    star["resolved"] = True    # stop the current star quietly
+                    self.active = None
+                    cancelled = True
+            if cancelled:
+                self.caught_event.set()        # wakes the game thread; no vanish message
+
+    def _handle_admin(self, sender, reply_to, message):
+        parts = message.split()
+        cmd = parts[0].lower()
+        arg = parts[1] if len(parts) > 1 else None
+
+        if cmd == "!stargame":
+            if arg is None or arg.lower() not in ("on", "off"):
+                state = "ON" if self.game_enabled else "OFF"
+                self.privmsg(reply_to, f"Star game is {state}. Use: !stargame on/off")
+                return
+            self._set_enabled(arg.lower() == "on")
+            if self.game_enabled:
+                mins = max(0, (self._next_spawn - time.time()) / 60)
+                self.privmsg(reply_to, f"Star game is now ON. Next star in about {mins:.0f} minutes")
+            else:
+                self.privmsg(reply_to, "Star game is now OFF. The bot stays connected. Use !stargame on to resume")
+            return
+
+        if cmd in ("!fminmin", "!fmaxmin"):
+            is_min = cmd == "!fminmin"
+            current = self.min_minutes if is_min else self.max_minutes
+            value = self._parse_number(arg)
+            if value is None:
+                self.privmsg(reply_to, f"{cmd} is currently {current:g} minutes. Use: {cmd} <minutes>")
+                return
+            if not 0 < value <= 1440:
+                self.privmsg(reply_to, "Minutes must be more than 0 and at most 1440")
+                return
+            if is_min and value > self.max_minutes:
+                self.privmsg(reply_to, f"Minimum cannot be more than the maximum ({self.max_minutes:g} minutes)")
+                return
+            if not is_min and value < self.min_minutes:
+                self.privmsg(reply_to, f"Maximum cannot be less than the minimum ({self.min_minutes:g} minutes)")
+                return
+            if is_min:
+                self.min_minutes = value
+                self._save_setting("fairy_min_minutes", f"{value:g}")
+            else:
+                self.max_minutes = value
+                self._save_setting("fairy_max_minutes", f"{value:g}")
+            label = "Minimum" if is_min else "Maximum"
+            if self.game_enabled:
+                self._schedule_next()      # apply right away to the next star
+                mins = max(0, (self._next_spawn - time.time()) / 60)
+                self.privmsg(reply_to, f"{label} is now {value:g} minutes. Next star in about {mins:.0f} minutes")
+            else:
+                self.privmsg(reply_to, f"{label} is now {value:g} minutes (star game is OFF)")
+            return
+
+        if cmd == "!fcsec":
+            value = self._parse_number(arg)
+            if value is None:
+                self.privmsg(reply_to, f"!fcsec is currently {self.catch_seconds:g} seconds. Use: !fcsec <seconds>")
+                return
+            if not 5 <= value <= 3600:
+                self.privmsg(reply_to, "Seconds must be between 5 and 3600")
+                return
+            self.catch_seconds = value
+            self._save_setting("fairy_catch_seconds", f"{value:g}")
+            self.privmsg(reply_to, f"Catch time is now {value:g} seconds (from the next star)")
+
     def _random_interval_seconds(self):
-        lo = min(FAIRY_MIN_MINUTES, FAIRY_MAX_MINUTES)
-        hi = max(FAIRY_MIN_MINUTES, FAIRY_MAX_MINUTES)
+        lo = min(self.min_minutes, self.max_minutes)
+        hi = max(self.min_minutes, self.max_minutes)
         return random.uniform(lo, hi) * 60
 
     def _schedule_next(self):
@@ -1658,13 +1855,16 @@ class MagicalFairy(IRCBot):
         self._load_next_spawn()
         while True:
             try:
-                while True:
-                    remaining = self._next_spawn - time.time()
-                    if remaining <= 0:
-                        break
-                    time.sleep(min(remaining, 15))
-                while not (self.running and self._registered and self.in_channel):
+                if not self.game_enabled:               # paused by an admin: stay connected, no stars
                     time.sleep(5)
+                    continue
+                remaining = self._next_spawn - time.time()
+                if remaining > 0:
+                    time.sleep(min(remaining, 15))
+                    continue
+                if not (self.running and self._registered and self.in_channel):
+                    time.sleep(5)
+                    continue
                 self._run_star_event()
             except Exception as exc:
                 print(f"[{self.nickname}] Game loop error: {type(exc).__name__}: {exc}")
@@ -1695,10 +1895,10 @@ class MagicalFairy(IRCBot):
             f"✨ A star named {name} has appeared in {FAIRY_CHANNEL}",
             "🎯 Type !catch or !grab to catch it!",
             f"🏆 Reward: +{FAIRY_REWARD} {FAIRY_STAR} Star!",
-            f"⏳ Hurry, the magic fades in {int(FAIRY_CATCH_SECONDS)} seconds!",
+            f"⏳ Hurry, the magic fades in {int(self.catch_seconds)} seconds!",
         ])
 
-        caught = self.caught_event.wait(FAIRY_CATCH_SECONDS)
+        caught = self.caught_event.wait(self.catch_seconds)
 
         expired = False
         if not caught:
@@ -1780,9 +1980,6 @@ class MagicalFairy(IRCBot):
 
         sender = parts[0].split('!')[0].lstrip(':')
         target = parts[2]
-        if target.lower() != FAIRY_CHANNEL.lower():
-            return  # the game lives only in #global
-
         message = " ".join(parts[3:])
         if message.startswith(':'):
             message = message[1:]
@@ -1791,6 +1988,16 @@ class MagicalFairy(IRCBot):
             return
 
         cmd = message.split()[0].lower()
+
+        # Admin commands work in #global or in a private message to MagicalFairy.
+        if cmd in ("!stargame", "!fminmin", "!fmaxmin", "!fcsec"):
+            in_pm = target.lower() == self.nickname.lower()
+            if sender.lower() in ADMIN_NICKS and (in_pm or target.lower() == FAIRY_CHANNEL.lower()):
+                self._handle_admin(sender, sender if in_pm else target, message)
+            return
+
+        if target.lower() != FAIRY_CHANNEL.lower():
+            return  # the game lives only in #global
         if cmd in ("!catch", "!grab"):
             self._handle_catch(sender)
         elif cmd == "!top":
