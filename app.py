@@ -59,7 +59,7 @@ FAIRY_STAR = "🌟"                      # the official reward emoji
 ADMIN_NICKS = {"antonio", "starboy", "sasha", "juggu", "antoniox"}
 
 # Extra line ChiefOper adds to its welcome in #ChatWithWorld, #Games and #global
-WEB_CLIENT_MSG = ("Visit https://worldofantonio.vercel.app/ and try out our web-based IRC client"
+WEB_CLIENT_MSG = ("Visit https://worldofantonio.vercel.app and try out our web-based IRC client"
                   "—connect, chat, and experience IRC right from your browser!")
 WEB_CLIENT_CHANNELS = ("#chatwithworld", "#games", "#global")
 
@@ -774,6 +774,15 @@ class ChiefOper(IRCBot):
                     return {"bios": {}, "points": {}, "notes": {}}
             return {"bios": {}, "points": {}, "notes": {}}
 
+    @property
+    def use_link(self):
+        """Whether the web-client line is added to the welcome message (default: on)."""
+        return bool(self.user_data.get("settings", {}).get("uselink", True))
+
+    def set_use_link(self, on):
+        self.user_data.setdefault("settings", {})["uselink"] = bool(on)
+        self.save_data()
+
     def save_data(self):
         with self.lock:
             try:
@@ -813,7 +822,7 @@ class ChiefOper(IRCBot):
                         f"rules or !usercmd- to see everything I can do."
                     )
 
-                if chan_lower in WEB_CLIENT_CHANNELS:
+                if chan_lower in WEB_CLIENT_CHANNELS and self.use_link:
                     self.privmsg(target_chan, WEB_CLIENT_MSG)
 
         if parts[1] == "PRIVMSG" and len(parts) >= 4:
@@ -831,6 +840,19 @@ class ChiefOper(IRCBot):
             if message == "!admison":
                 self.admin = sender_nick
                 self.privmsg(target, f"Admin successfully claimed by: {self.admin}")
+                return
+
+            # !uselink on/off - admins only (works in a channel or in PM)
+            if message.split()[:1] and message.split()[0].lower() == "!uselink":
+                if sender_nick.lower() in ADMIN_NICKS:
+                    args = message.split()
+                    choice = args[1].lower() if len(args) > 1 else ""
+                    if choice in ("on", "off"):
+                        self.set_use_link(choice == "on")
+                        self.privmsg(target, f"Web client link message is now {choice.upper()}")
+                    else:
+                        state = "ON" if self.use_link else "OFF"
+                        self.privmsg(target, f"Web client link message is {state}. Use: !uselink on/off")
                 return
 
             if self.only_admin_mode and not self.is_admin(sender_prefix):
