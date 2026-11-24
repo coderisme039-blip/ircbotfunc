@@ -58,7 +58,7 @@ FAIRY_STAR = "🌟"                      # the official reward emoji
 # (!stargame, !fminmin, !fmaxmin, !fcsec). Matched by nickname, case-insensitive.
 ADMIN_NICKS = {"antonio", "starboy", "sasha", "juggu", "antoniox"}
 
-# Extra line ChiefOper adds to its welcome in #ChatWithWorld, #Games and #global
+# Line ChiefOper sends as a NOTICE to users who join #ChatWithWorld, #Games and #global
 WEB_CLIENT_MSG = ("Visit https://worldofantonio.vercel.app and try out our web-based IRC client"
                   "—connect, chat, and experience IRC right from your browser!")
 WEB_CLIENT_CHANNELS = ("#chatwithworld", "#games", "#global")
@@ -823,7 +823,8 @@ class ChiefOper(IRCBot):
                     )
 
                 if chan_lower in WEB_CLIENT_CHANNELS and self.use_link:
-                    self.privmsg(target_chan, WEB_CLIENT_MSG)
+                    # sent privately to the joining user as a NOTICE (like /notice username ...)
+                    self.send(f"NOTICE {sender_nick} :{WEB_CLIENT_MSG}")
 
         if parts[1] == "PRIVMSG" and len(parts) >= 4:
             sender_prefix = parts[0]
