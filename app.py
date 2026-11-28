@@ -1293,7 +1293,7 @@ class ChiefOper(IRCBot):
 
                 threading.Thread(target=run_scramble, daemon=True).start()
 
-        elif cmd == "!fire":
+        elif cmd == "!firetext":
             if text_arg:
                 for line in TextLab.fire(text_arg):
                     self.privmsg(target, line)
@@ -1337,7 +1337,7 @@ class ChiefOper(IRCBot):
                 "!wave <text> | !gradient <text> | !rainbow2 <text>",
                 "!type <text> | !loading <text> | !bar <pct> [\"label\"]",
                 "!matrix <text> | !explode <text> | !implode <text> | !scramble <text>",
-                "!fire <text> | !neon <text> | !terminal <text>",
+                "!firetext <text> | !neon <text> | !terminal <text>",
                 f"!transform <style> <text> - styles: {', '.join(TextLab.TRANSFORM_STYLES)}",
                 "(admin) !animson / !animsoff - toggle animated multi-message effects",
             ]
